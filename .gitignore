@@ -1,3 +1,4 @@
 wandb/
 backup/
 .vscode/
+__pycache__
