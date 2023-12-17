@@ -14,7 +14,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f'using {device} for training')
 
 print("lewding data...")
-pgn = open("/home/luna/Downloads/lichess_db_standard_rated_2023-09.pgn")
+pgn = open("/home/luna/Downloads/lichess_db_standard_rated_2023-10.pgn")
 
 
 def encode(fen):

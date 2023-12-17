@@ -3,6 +3,7 @@ import torch
 import numpy as np
 import chess
 import re
+import threading
 from safetensors.torch import load_file, save_file
 from evaluation import eval_pos
 
@@ -49,7 +50,7 @@ class ChessModel(torch.nn.Module):
     data = self.layer_norm(self.gelu(self.f4(data))) + data
 
     return self.f5(data)
-  
+
 class ChessFromModel(torch.nn.Module):
   def __init__(self, input_dimension=1024, feature=620):
     super().__init__()
@@ -72,13 +73,19 @@ class ChessFromModel(torch.nn.Module):
 
     return self.f5(data).reshape(2, 64)
 
-model = torch.load('chess5.model').to(device)
-fmodel = torch.load('chess_from.model').to(device)
-search_depth = 7
-search_moves = 2
-search_pieces = 2
+# Changed from 7,2,2 since this seemed to work better
+search_depth = 5
+search_moves = 3
+search_pieces = 4
 
-def best_moves(fen, side, movables):
+models = []
+fmodels = []
+
+for i in range(search_moves * search_pieces):
+  models.append(torch.load('chess5.model').to(device))
+  fmodels.append(torch.load('chess_from.model').to(device))
+
+def best_moves(fen, side, movables, model, fmodel):
   from_out = fmodel(fen).tolist()[side]
   best_from = list(filter(
     lambda x: x in movables,
@@ -123,90 +130,122 @@ def flip_idx(idx):
 def is_enemy(depth):
   return depth % 2 == 0
 
-nodes = 0
+infinity = 10000000
 
-def find_best_move(board, depth=1, prev_highest=-99999999):
-  global nodes
-
-  if depth == 1:
-    nodes = 0
-  elif depth > search_depth:
-    return None
+def find_best_move(board, depth=1, results=None, res_idx=0):
+  if depth > search_depth:
+    if depth != 2:
+      return None
+    else:
+      results[res_idx] = None
 
   encoded = encode(board.fen())
   legals = board.legal_moves
   movable_pieces = list(set([m.from_square for m in legals]))
   side = 0 if board.turn == chess.WHITE else 1
   if len(movable_pieces) < 1:
-    return None
+    # If there's no moves it means checkmate or stalemate. If checkmate it's infinity value for the other player.
+    # Uses 1/3 infinity so it won't be overriden by the initial score=-infinity
+    rs = (None, infinity / 3 * board.is_checkmate())
+    if depth != 2:
+      return rs
+    else:
+      results[res_idx] = rs
 
-  score = eval_pos(encoded, side)
-  out = best_moves(torch.tensor([encoded]).to(device), side, movable_pieces)
+  # With the starting score set to eval_pos(encoded, side), it would give up if all moves are worse than the current state.
+  # Set it to -infinity so it always tries to get the best.
+  score = -infinity # eval_pos(encoded, side)
+  out = best_moves(torch.tensor([encoded]).to(device), side, movable_pieces, models[res_idx], fmodels[res_idx])
 
   best = (0, 0)
-  best_branch = (0, 0)
-  highest = prev_highest
+  threads = []
+  if depth == 1:
+    results = [None] * (search_moves * search_pieces)
 
   if depth <= search_depth:
     for i in range(len(out[0])):
       if i >= search_pieces:
         break
       for i2 in range(search_moves):
-        nodes += 1
         move = ensure_legal(out, legals, i, i2 + 1)
         if move == None:
           continue
         board.push(move)
-        this_eval = eval_pos(encode(board.fen()), side)
-        if this_eval > score:
-          best = (i, i2 + 1)
-          score = this_eval
-        res = find_best_move(board, depth + 1, highest)
-        if res:
-          if depth == search_depth:
-            if res[1] > highest:
-              highest = res[1]
-              print(f'info string Hit deepest branch, eval: {highest}')
-          elif depth == 1:
-            print(f'info string Propagating highest to root branch')
-            if res[2] > highest:
-              highest = res[2]
-              best_branch = (i, i2 + 1)
-              print(f'info string Best branch is now {best_branch}')
+        if depth == search_depth:
+          # Test checkmate here too. Also, evaluations seems to be reversed for some reason and worked better with the side flipped
+          this_eval = eval_pos(encode(board.fen()), flip_idx(side)) + infinity/2 * board.is_checkmate()
+          if this_eval > score:
+            best = (i, i2 + 1)
+            score = this_eval
+        else:
+          if depth == 1:
+            thr = threading.Thread(target=find_best_move, args=(chess.Board(board.fen()), depth + 1, results, search_moves * i + i2))
+            thr.start()
+            threads.append(thr)
           else:
-            if res[2] > highest:
-              highest = res[2]
-            elif highest == -99999999:
-              highest = res[1]
-        elif highest == -99999999:
-          highest = prev_highest
+            res = find_best_move(board, depth + 1)
+            if res and res[1] > score:
+              best = (i, i2 + 1)
+              score = res[1]
+          # if res:
+          #   if depth == search_depth:
+          #     if res[1] > highest:
+          #       highest = res[1]
+          #       print(f'info string Hit deepest branch, eval: {highest}')
+          #   elif depth == 1:
+          #     print(f'info string Propagating highest to root branch')
+          #     if res[2] > highest:
+          #       highest = res[2]
+          #       best_branch = (i, i2 + 1)
+          #       print(f'info string Best branch is now {best_branch}')
+          #   else:
+          #     if res[2] > highest:
+          #       highest = res[2]
+          #     elif highest == 0:
+          #       highest = res[1]
+          # elif highest == 0:
+          #   highest = prev_highest
         board.pop()
-  
+
+  if depth == 1:
+    i = 0
+    for t in threads:
+      t.join()
+    print(f'info string {results}')
+    for r in results:
+      if r and r[1] > score:
+        best = (i // search_moves, i % search_moves + 1)
+        score = r[1]
+      i += 1
+
   picked_move = None
 
   if depth == 1:
-    print(f'info string Highest Eval: {highest}')
-    picked_move = ensure_legal(out, legals, best_branch[0], best_branch[1])
+    print(f'info string Highest Eval: {score}')
+    print(f'info string Playing: {best}')
+    picked_move = ensure_legal(out, legals, best[0], best[1])
     if picked_move == None:
-      print("info string Warning: Playing suboptimal move!")
-      picked_move = ensure_legal(out, legals, best[0], best[1])
-      if picked_move == None:
-        print("info string Warning: Playing first possible move.")
-        picked_move = ensure_legal(out, legals, 0, 1)
+      print("info string Warning: Playing first possible move.")
+      picked_move = ensure_legal(out, legals, 0, 1)
   else:
     picked_move = ensure_legal(out, legals, best[0], best[1])
 
   if not picked_move:
     return None
 
-  board.push(picked_move)
-  encoded = encode(board.fen())
-  board.pop()
+  # board.push(picked_move)
+  # encoded = encode(board.fen())
+  # board.pop()
 
   # if depth == 1:
   #   print("")
 
-  return (picked_move, eval_pos(encoded, side if is_enemy(depth) else flip_idx(side)), highest)
+  # `score` is the best result we could get, so this position is worth -score to the other player.
+  # Changed this from the eval_pos so that it would use the recursive score.
+  if depth != 2:
+    return (picked_move, -score)
+  else:
+    results[res_idx] = (picked_move, -score)
 
 board = chess.Board()
 opponent_move = None
@@ -231,7 +270,7 @@ def run():
   elif cmd.startswith('position'):
     m = re.findall('^position\s+(.+)\s+moves\s+(.+)$', cmd)
     if len(m) != 1:
-      return run() 
+      return run()
     if m[0][0] == 'startpos':
       board.reset()
     else:
