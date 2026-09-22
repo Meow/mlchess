@@ -154,25 +154,263 @@ flip_list = [
   ],
 ]
 
+# --- how the encoded board lines up with the tables above ------------------
+#
+# `board` is what encode() produces: 64 ints in FEN reading order, so index 0
+# is a8 and index 63 is h1, with 1-6 = black p,r,n,b,q,k and 7-12 = white.
+# Two things about that do not line up with blunder's tables, and both used to
+# be indexed straight through:
+#
+#  * The tables are in blunder's order (pawn, knight, bishop, rook, queen,
+#    king), but the encoding alphabet is ".prnbqk". Reading table[piece - 1]
+#    scored every rook off the knight table and every bishop off the rook
+#    table, so the engine thought a bishop outweighed a rook.
+#  * The tables are written from White's side with a8 first, which is already
+#    the orientation encode() hands us. White therefore reads them straight and
+#    only Black's squares need mirroring -- blunder mirrors White instead
+#    because its own squares are a1-first. Mirroring the wrong colour turned
+#    every table upside down for both sides: a pawn one square from queening
+#    scored less than one still on its starting square, and the midgame king
+#    table pulled the king up the board instead of into the corner.
+
+PAWN, KNIGHT, BISHOP, ROOK, QUEEN, KING = range(6)
+
+# ".prnbqk" order -> table order
+piece_to_table = [PAWN, ROOK, KNIGHT, BISHOP, QUEEN, KING]
+
+# indexed by colour: 0 = black (mirrored), 1 = white (as written)
+pov_list = [flip_list[1], flip_list[0]]
+
+material_vals = [100, 320, 330, 500, 900, 0]
+
+# --- extra terms the piece-square tables do not cover ----------------------
+# Indexed by relative rank: 0 is the pawn's own back rank, 6 is one step from
+# queening. Endgame numbers are deliberately large -- a protected passer is
+# usually the whole point of a pawn endgame.
+passed_mg = [0, 2, 6, 14, 28, 52, 88, 0]
+passed_eg = [0, 10, 22, 42, 78, 130, 200, 0]
+
+doubled_mg, doubled_eg = -9, -22
+isolated_mg, isolated_eg = -14, -12
+bishop_pair_mg, bishop_pair_eg = 24, 44
+rook_open_mg, rook_open_eg = 24, 10
+rook_semi_mg, rook_semi_eg = 11, 5
+rook_seventh_mg, rook_seventh_eg = 16, 24
+shield_missing_mg = -16
+king_open_file_mg = -18
+undeveloped_mg = -13
+early_queen_mg = -28
+blocked_center_pawn_mg = -16
+
+# home squares, as encode() indexes them (0 = a8)
+home_minor = [
+  {KNIGHT: (1, 6), BISHOP: (2, 5)},      # black b8/g8, c8/f8
+  {KNIGHT: (57, 62), BISHOP: (58, 61)},  # white b1/g1, c1/f1
+]
+home_queen = [3, 59]                      # d8, d1
+home_center_pawns = [(11, 12), (51, 52)]  # d7/e7, d2/e2
+forward_step = [8, -8]                    # one rank towards the enemy
+
+center_distance = [
+  6, 5, 4, 3, 3, 4, 5, 6,
+  5, 4, 3, 2, 2, 3, 4, 5,
+  4, 3, 2, 1, 1, 2, 3, 4,
+  3, 2, 1, 0, 0, 1, 2, 3,
+  3, 2, 1, 0, 0, 1, 2, 3,
+  4, 3, 2, 1, 1, 2, 3, 4,
+  5, 4, 3, 2, 2, 3, 4, 5,
+  6, 5, 4, 3, 3, 4, 5, 6,
+]
+
+def sq_file(i):
+  return i & 7
+
+def sq_rank(i):
+  # 0 = rank 1, 7 = rank 8
+  return 7 - (i >> 3)
+
+def rel_rank(color, i):
+  # 0 = the colour's own back rank, 7 = the rank it promotes on
+  r = sq_rank(i)
+  return r if color == 1 else 7 - r
+
+def manhattan(a, b):
+  return abs(sq_file(a) - sq_file(b)) + abs(sq_rank(a) - sq_rank(b))
+
 def eval_pos(board, side = 0):
+  other_side = 1 if side == 0 else 0
+
   mg = [0, 0]
   eg = [0, 0]
+  material = [0, 0]
   phase = total_phase
-  other_side = 1 if side == 0 else 0
+
+  pawn_ranks = [[[] for _ in range(8)], [[] for _ in range(8)]]
+  pawns = [[], []]
+  rooks = [[], []]
+  bishops = [0, 0]
+  minors = [0, 0]
+  at_home = [0, 0]
+  queens = [0, 0]
+  queen_out = [0, 0]
+  kings = [None, None]
 
   for i in range(64):
     piece = board[i]
     if piece == 0:
       continue
-    piece_color = 0 if piece < 7 else 1
-    piece = piece - 7 if piece >= 7 else piece - 1
+    color = 0 if piece < 7 else 1
+    kind = piece_to_table[(piece - 1) if piece < 7 else (piece - 7)]
+    sq = pov_list[color][i]
 
-    mg[piece_color] += midgame_piece_pos[piece][flip_list[piece_color][i]]
-    eg[piece_color] += endgame_piece_pos[piece][flip_list[piece_color][i]]
-    phase -= phase_vals[piece]
+    mg[color] += midgame_piece_pos[kind][sq]
+    eg[color] += endgame_piece_pos[kind][sq]
+    material[color] += material_vals[kind]
+    phase -= phase_vals[kind]
+
+    if kind == PAWN:
+      pawns[color].append(i)
+      pawn_ranks[color][sq_file(i)].append(sq_rank(i))
+    elif kind == KING:
+      kings[color] = i
+    elif kind == ROOK:
+      rooks[color].append(i)
+    elif kind == QUEEN:
+      queens[color] += 1
+      if i != home_queen[color]:
+        queen_out[color] += 1
+    else:
+      minors[color] += 1
+      if kind == BISHOP:
+        bishops[color] += 1
+      if i in home_minor[color][kind]:
+        at_home[color] += 1
+
+  # Bare kings, or a lone minor that cannot mate, is a dead draw however nice
+  # the piece-square tables think the squares are.
+  if (not pawns[0] and not pawns[1]
+      and not rooks[0] and not rooks[1]
+      and not queens[0] and not queens[1]
+      and material[0] <= 330 and material[1] <= 330):
+    return 0
+
+  for color in (0, 1):
+    enemy = 1 if color == 0 else 0
+    ahead = (lambda er, r: er > r) if color == 1 else (lambda er, r: er < r)
+
+    for i in pawns[color]:
+      f = sq_file(i)
+      r = sq_rank(i)
+      rel = rel_rank(color, i)
+
+      if len(pawn_ranks[color][f]) > 1:
+        mg[color] += doubled_mg
+        eg[color] += doubled_eg
+
+      if not ((f > 0 and pawn_ranks[color][f - 1])
+              or (f < 7 and pawn_ranks[color][f + 1])):
+        mg[color] += isolated_mg
+        eg[color] += isolated_eg
+
+      passed = True
+      for ff in (f - 1, f, f + 1):
+        if ff < 0 or ff > 7:
+          continue
+        for er in pawn_ranks[enemy][ff]:
+          if ahead(er, r):
+            passed = False
+            break
+        if not passed:
+          break
+      # a pawn stuck behind one of its own is not going anywhere either
+      if passed:
+        for orr in pawn_ranks[color][f]:
+          if ahead(orr, r):
+            passed = False
+            break
+
+      if passed:
+        mg[color] += passed_mg[rel]
+        eg[color] += passed_eg[rel]
+        # Whose king gets to the queening square first usually decides it.
+        if rel >= 3 and kings[color] is not None and kings[enemy] is not None:
+          promo = sq_file(i) if color == 1 else 56 + sq_file(i)
+          eg[color] += 7 * manhattan(kings[enemy], promo)
+          eg[color] -= 5 * manhattan(kings[color], promo)
+
+    if bishops[color] >= 2:
+      mg[color] += bishop_pair_mg
+      eg[color] += bishop_pair_eg
+
+    for i in rooks[color]:
+      f = sq_file(i)
+      if not pawn_ranks[color][f]:
+        if not pawn_ranks[enemy][f]:
+          mg[color] += rook_open_mg
+          eg[color] += rook_open_eg
+        else:
+          mg[color] += rook_semi_mg
+          eg[color] += rook_semi_eg
+      if rel_rank(color, i) == 6:
+        mg[color] += rook_seventh_mg
+        eg[color] += rook_seventh_eg
+
+    # --- opening and king safety, midgame only ---------------------------
+    at_home_count = at_home[color]
+    mg[color] += undeveloped_mg * at_home_count
+
+    # A queen that comes out before the minors do just gets chased around.
+    if queen_out[color] and at_home_count >= 2:
+      mg[color] += early_queen_mg
+
+    # The classic "bishop parked in front of its own d/e pawn".
+    step = forward_step[color]
+    own_pawn = 7 if color == 1 else 1
+    for p in home_center_pawns[color]:
+      if board[p] == own_pawn and board[p + step] != 0:
+        mg[color] += blocked_center_pawn_mg
+
+    k = kings[color]
+    if k is not None and rel_rank(color, k) <= 1:
+      kf = sq_file(k)
+      kr = sq_rank(k)
+      shield = 0
+      for ff in (kf - 1, kf, kf + 1):
+        if ff < 0 or ff > 7:
+          continue
+        covered = False
+        for pr in pawn_ranks[color][ff]:
+          if 1 <= (pr - kr if color == 1 else kr - pr) <= 2:
+            covered = True
+            break
+        if covered:
+          shield += 1
+        elif not pawn_ranks[color][ff]:
+          mg[color] += king_open_file_mg
+      mg[color] += shield_missing_mg * (3 - shield)
+
+  # --- mop-up: with a decisive edge and no enemy pawns, walk their king to
+  # the edge and bring yours in, otherwise a won K+Q/K+R ending just shuffles.
+  mop_up = 0
+  for color in (0, 1):
+    enemy = 1 if color == 0 else 0
+    if (material[color] - material[enemy] >= 450 and not pawns[enemy]
+        and kings[color] is not None and kings[enemy] is not None):
+      bonus = (47 * center_distance[kings[enemy]]
+               + 16 * (14 - manhattan(kings[color], kings[enemy]))) // 10
+      mop_up += bonus if color == 1 else -bonus
 
   mg_total = mg[side] - mg[other_side]
   eg_total = eg[side] - eg[other_side]
+  if side == 1:
+    eg_total += mop_up
+  else:
+    eg_total -= mop_up
+
   phase = (phase * 256 + total_phase // 2) // total_phase
 
-  return (mg_total * (256 - phase) + eg_total * phase) // 256
+  # Truncate towards zero rather than flooring, so that eval(pos) == -eval(mirrored pos)
+  # exactly. Flooring biases every negative score down by one centipawn, which is
+  # harmless on its own but makes the search's negamax negations slightly lopsided.
+  total = mg_total * (256 - phase) + eg_total * phase
+  return total // 256 if total >= 0 else -((-total) // 256)

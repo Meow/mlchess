@@ -2,3 +2,4 @@ wandb/
 backup/
 .vscode/
 __pycache__
+.venv/
