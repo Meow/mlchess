@@ -1,5 +1,7 @@
 # NightyBot RL on the 4090 box. Every service is the same image with a
-# different script; arguments after the service name go to that script:
+# different script as its entrypoint (not its command: `docker compose run`
+# replaces the command with whatever follows the service name, and appends
+# it to the entrypoint), so arguments after the service name go to the script:
 #
 #   docker compose build
 #   docker compose run --rm train                       # resumes rl_checkpoint.pt if present
@@ -37,17 +39,17 @@ x-nighty: &nighty
 services:
   train:
     <<: *nighty
-    command: ["train_rl.py"]
+    entrypoint: ["python3", "train_rl.py"]
 
   eval:
     <<: *nighty
-    command: ["rl_eval.py"]
+    entrypoint: ["python3", "rl_eval.py"]
 
   test:
     <<: *nighty
-    command: ["test_rl.py"]
+    entrypoint: ["python3", "test_rl.py"]
 
   engine:
     <<: *nighty
-    command: ["run_rl.py"]
+    entrypoint: ["python3", "run_rl.py"]
     stdin_open: true
