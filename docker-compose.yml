@@ -1,0 +1,53 @@
+# NightyBot RL on the 4090 box. Every service is the same image with a
+# different script; arguments after the service name go to that script:
+#
+#   docker compose build
+#   docker compose run --rm train                       # resumes rl_checkpoint.pt if present
+#   docker compose run --rm train --wandb --max-minutes 480 --games-per-actor 8192
+#   docker compose run --rm eval --opponent nightybot --games 40
+#   docker compose run --rm test                        # test_rl.py
+#   docker compose run --rm engine                      # UCI engine on stdin
+#
+# The checkout is mounted at /app, so nighty_rl.pt, rl_checkpoint.pt,
+# rl_snapshots/ and wandb/ are written straight into it. Put WANDB_API_KEY in
+# a .env file next to this (see .env.example) for `--wandb`.
+
+x-nighty: &nighty
+  build: .
+  image: nightybot-rl
+  volumes:
+    # :z relabels for SELinux, which Fedora enforces on bind mounts.
+    - .:/app:z
+  # Files written to the mount are owned by you, not root.
+  user: "${UID:-1000}:${GID:-1000}"
+  environment:
+    WANDB_API_KEY: ${WANDB_API_KEY:-}
+    WANDB_MODE: ${WANDB_MODE:-online}
+  # Actors and learner hand games and weights through shared memory, and the
+  # container's own /dev/shm is 64 MB; use the host's instead.
+  ipc: host
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu]
+
+services:
+  train:
+    <<: *nighty
+    command: ["train_rl.py"]
+
+  eval:
+    <<: *nighty
+    command: ["rl_eval.py"]
+
+  test:
+    <<: *nighty
+    command: ["test_rl.py"]
+
+  engine:
+    <<: *nighty
+    command: ["run_rl.py"]
+    stdin_open: true

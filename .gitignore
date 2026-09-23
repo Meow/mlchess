@@ -3,3 +3,8 @@ backup/
 .vscode/
 __pycache__
 .venv/
+rl_checkpoint.pt
+rl_snapshots/
+*.pt.tmp
+rust/target/
+.env

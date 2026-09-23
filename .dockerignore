@@ -1,0 +1,12 @@
+.venv
+.git
+wandb
+backup
+rust/target
+rl_snapshots
+rl_checkpoint.pt
+*.pt.tmp
+__pycache__
+experiments
+*.safetensors
+.vscode
