@@ -162,7 +162,17 @@ class UCIPlayer:
       pass
 
 def stockfish_path():
-  return os.environ.get('STOCKFISH') or shutil.which('stockfish')
+  """$STOCKFISH, else the binary on PATH, else where the usual packages put it
+  (Debian and Ubuntu's apt package lives in /usr/games, which is not on PATH
+  in most containers)."""
+  found = os.environ.get('STOCKFISH') or shutil.which('stockfish')
+  for candidate in ('/usr/games/stockfish', '/usr/local/bin/stockfish',
+                    '/opt/homebrew/bin/stockfish', '/usr/bin/stockfish'):
+    if found:
+      break
+    if os.access(candidate, os.X_OK):
+      found = candidate
+  return found
 
 def stockfish_player(elo, seconds):
   """Stockfish held down to `elo` with its own UCI_LimitStrength handicap,

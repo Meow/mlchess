@@ -39,7 +39,7 @@ COPY *.py run.sh run_rl.sh ./
 COPY chess5.model chess_from.model ./
 
 # Writable home for wandb and torch caches, whatever uid the container runs as.
-ENV HOME=/tmp/home WANDB_DIR=/app/wandb PYTHONUNBUFFERED=1
+ENV HOME=/tmp/home WANDB_DIR=/app/wandb PYTHONUNBUFFERED=1 STOCKFISH=/usr/games/stockfish
 RUN mkdir -p /tmp/home && chmod 777 /tmp/home
 
 ENTRYPOINT ["python3"]
