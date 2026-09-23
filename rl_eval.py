@@ -90,9 +90,11 @@ class RandomPlayer:
 
 class GreedyPlayer:
   """Alpha-beta to a fixed depth over every legal move, scored with
-  evaluation.py. Depth 1 grabs anything hanging and never sees the recapture;
-  depth 2 does. Neither is strong, which is the point: a yardstick an RL net
-  should pass early, and whose score keeps meaning the same thing."""
+  evaluation.py, in Python. Depth 1 grabs anything hanging and never sees the
+  recapture; depth 2 does. Neither is strong, which is the point: a yardstick
+  an RL net should pass early, and whose score keeps meaning the same thing.
+  ClassicalPlayer is the same engine in Rust and is what actually gets used
+  when the extension is built; this is its fallback."""
 
   MATE = 1000000
 
@@ -236,8 +238,8 @@ def make_player(spec, device='cpu', sims=200, seconds=0.5, backend='auto'):
     return RandomPlayer()
   if kind == 'stockfish':
     return stockfish_player(int(arg) if arg else 1320, seconds)
-  if kind == 'greedy':
-    return GreedyPlayer(int(arg) if arg else 1)
+  if kind == 'greedy':      # the classical engine one ply deep
+    return ClassicalPlayer(int(arg) if arg else 1)
   if kind == 'classical':
     return ClassicalPlayer(int(arg) if arg else 2)
   if kind == 'nightybot':

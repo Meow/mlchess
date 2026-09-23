@@ -111,7 +111,7 @@ def parse_args(argv=None):
                  help='what each game is played against, with weights: self (both sides the '
                       'current net), snapshot (an earlier net from rl_snapshots/), classical (the '
                       'Rust alpha-beta over evaluation.py, --classical-depth plies), random, and '
-                      'greedy (the same idea in Python, 1 ply, ~1 ms a move: keep its share tiny)')
+                      'greedy (the same engine one ply deep)')
   g.add_argument('--opponents-final', default='self=0.7,snapshot=0.2,classical=0.1',
                  help='the mix at --opponents-steps and after; interpolated linearly until then')
   g.add_argument('--classical-depth', type=int, default=2,
@@ -268,8 +268,8 @@ class OpponentPool:
     self.rng = rng
     self.snapshot_dir = snapshot_dir
     self.snapshots = {}      # file name -> backend playing that net
-    self.greedy = rl_eval.GreedyPlayer(1)
     self.classical = rl_eval.ClassicalPlayer(args.classical_depth, seed=int(rng.integers(1 << 30)))
+    self.greedy = rl_eval.ClassicalPlayer(1, seed=int(rng.integers(1 << 30)))
     self.checked = 0.0
     self.refresh()
 
@@ -381,10 +381,8 @@ class SelfPlayGame:
     if self.mover_backend() is None:
       if move is not None:
         pass
-      elif self.kind == 'greedy':
-        move = self.pool.greedy.best(board)
-      elif self.kind == 'classical':
-        move = self.pool.classical.choose([board])[0]
+      elif self.kind in ('greedy', 'classical'):
+        move = getattr(self.pool, self.kind).choose([board])[0]
       else:
         legal = list(board.legal_moves)
         move = legal[self.rng.integers(len(legal))]
@@ -518,8 +516,11 @@ def actor_main(rank, args, shared, lock, version, games_q, sims, resign_on, step
     idle.clear()
     # The classical engine searches all of its moves for this step at once,
     # on every core, instead of one game at a time.
-    classical = [n for n in ready if games[n].kind == 'classical' and games[n].mover_backend() is None]
-    chosen = dict(zip(classical, pool.classical.choose([games[n].board for n in classical]))) if classical else {}
+    chosen = {}
+    for kind in ('classical', 'greedy'):
+      due = [n for n in ready if games[n].kind == kind and games[n].mover_backend() is None]
+      if due:
+        chosen.update(zip(due, getattr(pool, kind).choose([games[n].board for n in due])))
     for n in ready:
       record = games[n].play_move(chosen.get(n))
       if record is not None:
