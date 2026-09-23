@@ -9,11 +9,13 @@ only definition there is and loading does not care what __main__ is.
 """
 
 import contextlib
+import math
 import os
 
 import chess
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 # --- position encoding --------------------------------------------------------
 #
@@ -84,21 +86,69 @@ class Block(nn.Module):
   def forward(self, x):
     return x + self.f2(self.gelu(self.f1(self.norm(x))))
 
-class RLNet(nn.Module):
-  """Same shape of idea as the imitation nets -- embed every square, flatten,
-  residual MLP -- with two heads on top: policy logits over N_MOVES, and
-  win/draw/loss logits for the side to move, in that order."""
+class Attention(nn.Module):
+  """One pre-norm transformer layer over the 64 squares."""
 
-  def __init__(self, width=512, blocks=4, embedding=16):
+  def __init__(self, width, heads):
     super().__init__()
-    self.config = {'width': width, 'blocks': blocks, 'embedding': embedding}
-    self.em_board = nn.Embedding(N_TOKENS, embedding)
-    self.f_in = nn.Linear(64 * embedding + 1, width)
-    self.blocks = nn.ModuleList(Block(width) for _ in range(blocks))
-    self.norm = nn.LayerNorm(width)
-    self.policy = nn.Linear(width, N_MOVES)
-    self.value = nn.Sequential(nn.Linear(width, 128), nn.GELU(), nn.Linear(128, 3))
+    if width % heads:
+      raise ValueError(f'width {width} is not a multiple of heads {heads}')
+    self.heads = heads
+    self.norm1 = nn.LayerNorm(width)
+    self.qkv = nn.Linear(width, 3 * width)
+    self.proj = nn.Linear(width, width)
+    self.norm2 = nn.LayerNorm(width)
+    self.f1 = nn.Linear(width, 4 * width)
+    self.f2 = nn.Linear(4 * width, width)
     self.gelu = nn.GELU()
+
+  def forward(self, x):
+    b, n, d = x.shape
+    q, k, v = self.qkv(self.norm1(x)).view(b, n, 3, self.heads, d // self.heads).unbind(2)
+    a = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2))
+    x = x + self.proj(a.transpose(1, 2).reshape(b, n, d))
+    return x + self.f2(self.gelu(self.f1(self.norm2(x))))
+
+class RLNet(nn.Module):
+  """Two heads on one trunk: policy logits over N_MOVES, and win/draw/loss
+  logits for the side to move, in that order.
+
+  arch='transformer' (the default for new training runs): every square is a
+  token, attention layers mix them, the policy is read off pairs of squares
+  -- a from-square query against a to-square key gives the 64x64 block of
+  move logits, and the 72 underpromotion slots come off the from-squares on
+  the seventh rank -- and the value off the mean of the squares. A pattern
+  learned on one square is learned on all of them.
+
+  arch='mlp' (the first runs): embed every square, flatten, residual MLP,
+  linear heads. Every pattern has to be learned once per square it can
+  occur on, which is what put the MLP runs on a plateau."""
+
+  def __init__(self, width=512, blocks=4, embedding=16, arch='mlp', heads=8):
+    super().__init__()
+    self.arch = arch
+    if arch == 'mlp':
+      self.config = {'width': width, 'blocks': blocks, 'embedding': embedding}
+      self.em_board = nn.Embedding(N_TOKENS, embedding)
+      self.f_in = nn.Linear(64 * embedding + 1, width)
+      self.blocks = nn.ModuleList(Block(width) for _ in range(blocks))
+      self.norm = nn.LayerNorm(width)
+      self.policy = nn.Linear(width, N_MOVES)
+      self.value = nn.Sequential(nn.Linear(width, 128), nn.GELU(), nn.Linear(128, 3))
+      self.gelu = nn.GELU()
+    elif arch == 'transformer':
+      self.config = {'arch': arch, 'width': width, 'blocks': blocks, 'heads': heads}
+      self.em_board = nn.Embedding(N_TOKENS, width)
+      self.em_square = nn.Parameter(torch.randn(64, width) * 0.02)
+      self.f_halfmove = nn.Linear(1, width)
+      self.blocks = nn.ModuleList(Attention(width, heads) for _ in range(blocks))
+      self.norm = nn.LayerNorm(width)
+      self.p_from = nn.Linear(width, width)
+      self.p_to = nn.Linear(width, width)
+      self.p_under = nn.Linear(width, 9)    # 3 directions x knight/bishop/rook, per from-square
+      self.value = nn.Sequential(nn.Linear(width, 128), nn.GELU(), nn.Linear(128, 3))
+    else:
+      raise ValueError(f'unknown arch {arch!r}')
     # An untrained net calls every position even. The policy head is left
     # randomly initialised on purpose: exactly uniform priors tie every move
     # at every node, argmax then always descends into the first legal move,
@@ -109,12 +159,23 @@ class RLNet(nn.Module):
     nn.init.zeros_(self.value[-1].bias)
 
   def forward(self, tokens, halfmove):
-    x = torch.cat((self.em_board(tokens).flatten(1), halfmove.unsqueeze(1)), 1)
-    x = self.gelu(self.f_in(x))
+    if self.arch == 'mlp':
+      x = torch.cat((self.em_board(tokens).flatten(1), halfmove.unsqueeze(1)), 1)
+      x = self.gelu(self.f_in(x))
+      for block in self.blocks:
+        x = block(x)
+      x = self.norm(x)
+      return self.policy(x), self.value(x)
+    x = self.em_board(tokens) + self.em_square + self.f_halfmove(halfmove.view(-1, 1, 1))
     for block in self.blocks:
       x = block(x)
     x = self.norm(x)
-    return self.policy(x), self.value(x)
+    # (B, 64 from, 64 to), flattened in move_index order: from * 64 + to.
+    pairs = torch.matmul(self.p_from(x), self.p_to(x).transpose(1, 2)) / math.sqrt(x.shape[-1])
+    # Underpromotions leave the seventh rank (squares 48-55, side to move's
+    # view); move_index numbers them (file, direction, piece), as this is.
+    under = self.p_under(x[:, 48:56]).flatten(1)
+    return torch.cat((pairs.flatten(1), under), 1), self.value(x.mean(1))
 
 def expected_score(wdl_logits):
   """Win minus loss probability, in [-1, 1]: the value the search backs up."""

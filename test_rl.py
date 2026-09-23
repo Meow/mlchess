@@ -275,6 +275,34 @@ if rl_backend.rust_available():
       g.tree.close()
 
 
+section('the transformer net')
+tnet = RLNet(arch='transformer', width=64, blocks=2, heads=4).eval()
+tokens_t, halfmove_t = encode(chess.Board('rnbqkbnr/pP4pp/8/8/8/8/1PPPPPPP/RNBQKBNR w KQkq - 0 1'))
+with torch.no_grad():
+  logits_t, wdl_t = tnet(torch.tensor([tokens_t]), torch.tensor([halfmove_t]))
+check('it returns logits over every move and three outcomes',
+      logits_t.shape == (1, N_MOVES) and wdl_t.shape == (1, 3))
+check('an untrained value head calls the position even', torch.allclose(wdl_t, torch.zeros(1, 3)))
+# The 64x64 block is (from, to): moving the from-square's piece changes its
+# row of logits and (through attention) others, but the underpromotion slots
+# read off the seventh rank only.
+b7 = chess.Move.from_uci('b7a8n')
+check('underpromotions land in their own slots past the 64x64 block',
+      4096 <= move_index(b7, chess.WHITE) < N_MOVES)
+tpath = os.path.join(tempfile.mkdtemp(prefix='nighty_rl_tnet_'), 'tnet.pt')
+from rl_model import save_net as _save
+_save(tnet, tpath)
+loaded = load_net(tpath).eval()
+with torch.no_grad():
+  again, _ = loaded(torch.tensor([tokens_t]), torch.tensor([halfmove_t]))
+check('it saves and loads back with its architecture', loaded.config == tnet.config and torch.allclose(again, logits_t))
+tsearch = rl_backend.make_backend(backends[-1], tnet, 'cpu', seed=5, threads=2)
+ttree = tsearch.tree(chess.Board('6k1/5ppp/8/8/8/8/8/R5K1 w - - 0 1'))
+ttree.reset_search(200)
+tsearch.run([ttree])
+check('the search finds mate in one with it', ttree.moves()[ttree.best()] == chess.Move.from_uci('a1a8'))
+ttree.close()
+
 section('learning')
 args = train_rl.parse_args(['--sims', '16', '--fast-sims', '4', '--full-prob', '1',
                             '--max-plies', '40', '--resign', '-1', '--backend', backends[-1]])
@@ -294,6 +322,19 @@ check('a finished game becomes training rows', n > 0 and record['tokens'].shape 
 probs = record['probs'].astype(np.float32)
 check('policy targets are distributions over legal moves only',
       np.allclose(probs.sum(1), 1, atol=1e-2) and np.all(probs[record['legal'] < 0] == 0))
+check('full searches give rows with a policy target',
+      record['policy_rows'] == n and np.all(record['weight'] == 1.0), f'({record["policy_rows"]} of {n} rows)')
+quick_args = train_rl.parse_args(['--sims', '16', '--fast-sims', '4', '--full-prob', '0',
+                                  '--max-plies', '40', '--resign', '-1', '--backend', backends[-1]])
+quick = [train_rl.SelfPlayGame(quick_args, rng, Flag(), game_backend)]
+quick_record = None
+while quick_record is None:
+  if quick[0].search_done():
+    quick_record = quick[0].play_move()
+  game_backend.step(None)
+check('quick searches give rows for the value head only',
+      quick_record['positions'] > 0 and quick_record['policy_rows'] == 0 and np.all(quick_record['weight'] == 0.0),
+      f'({quick_record["positions"]} rows, {quick_record["policy_rows"]} with a policy target)')
 check('value targets agree with the result',
       set(record['wdl']) <= ({1} if record['result'] == 0 else {0, 2}))
 

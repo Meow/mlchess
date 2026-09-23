@@ -33,6 +33,7 @@ Written to --out-dir:
 
 import argparse
 import contextlib
+import copy
 import os
 import queue
 import signal
@@ -126,12 +127,19 @@ def parse_args(argv=None):
                  help='minutes between looks at rl_snapshots/ for new ones')
 
   g = p.add_argument_group('model (ignored when resuming: the checkpoint wins)')
-  g.add_argument('--width', type=int, default=512)
-  g.add_argument('--blocks', type=int, default=4)
+  g.add_argument('--arch', default='transformer', choices=['transformer', 'mlp'],
+                 help='transformer: attention over the 64 squares, policy read off square pairs; '
+                      'mlp: the flattened-embedding residual MLP of the first runs')
+  g.add_argument('--width', type=int, default=None, help='default 256 (transformer) / 512 (mlp)')
+  g.add_argument('--blocks', type=int, default=None, help='default 8 (transformer) / 4 (mlp)')
+  g.add_argument('--heads', type=int, default=8, help='attention heads (transformer)')
 
   g = p.add_argument_group('learning')
   g.add_argument('--batch-size', type=int, default=512)
   g.add_argument('--lr', type=float, default=1e-3)
+  g.add_argument('--warmup', type=int, default=1000,
+                 help='training steps over which the learning rate ramps up from 0 at the start '
+                      'of a run (a transformer at full rate from step 0 can wreck its heads)')
   g.add_argument('--weight-decay', type=float, default=1e-4)
   g.add_argument('--buffer', type=int, default=250000, help='replay buffer size, in positions')
   g.add_argument('--min-buffer', type=int, default=20000,
@@ -139,6 +147,9 @@ def parse_args(argv=None):
   g.add_argument('--replay-ratio', type=float, default=4.0,
                  help='times each position is trained on, on average; the learner waits for '
                       'the actors rather than go over it')
+  g.add_argument('--ema', type=float, default=0.999,
+                 help='decay of the running average of the weights that the actors, evaluator, '
+                      'snapshots and nighty_rl.pt get instead of the raw ones; 0 = the raw ones')
   g.add_argument('--publish-every', type=int, default=50,
                  help='steps between handing new weights to the actors')
 
@@ -194,6 +205,10 @@ def parse_args(argv=None):
   # vice versa; a second process fills those gaps (measured 1.5x on MPS, a
   # third adds little). On CUDA an actor also overlaps the two inside itself
   # (--actor-lanes, see RustBackend). Each one holds ~9 GB at 4096 games.
+  if args.width is None:
+    args.width = 256 if args.arch == 'transformer' else 512
+  if args.blocks is None:
+    args.blocks = 8 if args.arch == 'transformer' else 4
   rust = args.backend == 'rust'
   if args.actors is None:
     args.actors = 2 if rust else max(1, cores - 2)
@@ -230,8 +245,8 @@ def mix_at(args, step):
 # The learner owns the real net. Actors each keep a private copy for inference
 # and refresh it from one flat shared-memory tensor whenever `version` moves.
 
-def publish(net, shared, lock, version):
-  flat = parameters_to_vector(net.parameters()).detach().float().cpu()
+def publish(params, shared, lock, version):
+  flat = parameters_to_vector(params).detach().float().cpu()
   with lock:
     shared.copy_(flat)
     version.value += 1
@@ -404,8 +419,11 @@ class SelfPlayGame:
     else:
       tree = self.tree
       visits = tree.visits()
-      if self.full and visits.sum() > 0:
-        self.rows.append(training_row(tree, visits, turn))
+      # Every own move is a row: its outcome trains the value head. Only a
+      # full search's visits are a policy target (a quick search's are not
+      # worth learning), so the others carry a policy weight of 0.
+      if self.ours() and visits.sum() > 0:
+        self.rows.append(training_row(tree, visits, turn, 1.0 if self.full else 0.0))
       if self.ours() and tree.q(tree.best()) < a.resign:
         if self.may_resign and self.resign_on.value:
           return self.finish(-1 if turn == chess.WHITE else 1, 'resign')
@@ -440,28 +458,31 @@ class SelfPlayGame:
     halfmove = np.zeros(n, np.float32)
     legal = np.full((n, MAX_MOVES), -1, np.int16)
     probs = np.zeros((n, MAX_MOVES), np.float16)
+    weight = np.zeros(n, np.float32)
     wdl = np.zeros(n, np.int8)
-    for j, (tok, hm, idx, p, turn) in enumerate(self.rows):
+    for j, (tok, hm, idx, p, turn, w) in enumerate(self.rows):
       tokens[j] = tok
       halfmove[j] = hm
       legal[j, :len(idx)] = idx
       probs[j, :len(p)] = p
+      weight[j] = w
       # win / draw / loss, for the side to move in that position
       if result == 0:
         wdl[j] = 1
       else:
         wdl[j] = 0 if (result == 1) == (turn == chess.WHITE) else 2
-    record.update(tokens=tokens, halfmove=halfmove, legal=legal, probs=probs, wdl=wdl)
+    record.update(tokens=tokens, halfmove=halfmove, legal=legal, probs=probs, weight=weight, wdl=wdl,
+                  policy_rows=int(weight.sum()))
     return record
 
-def training_row(tree, visits, turn):
+def training_row(tree, visits, turn, weight):
   tokens, halfmove, idx = tree.encoding()
   idx = np.asarray(idx, np.int16)
   visits = np.asarray(visits, np.float64)
   if len(idx) > MAX_MOVES:
     keep = np.argsort(-visits, kind='stable')[:MAX_MOVES]
     idx, visits = idx[keep], visits[keep]
-  return tokens, halfmove, idx, visits / visits.sum(), turn
+  return tokens, halfmove, idx, visits / visits.sum(), turn, weight
 
 def actor_device(name, rank, backend='python'):
   if name != 'auto':
@@ -614,6 +635,7 @@ class Replay:
     self.halfmove = np.zeros(capacity, np.float32)
     self.legal = np.full((capacity, MAX_MOVES), -1, np.int16)
     self.probs = np.zeros((capacity, MAX_MOVES), np.float16)
+    self.weight = np.zeros(capacity, np.float32)   # of the policy target: 1 full search, 0 quick
     self.wdl = np.zeros(capacity, np.int8)
     self.size = 0
     self.pos = 0
@@ -624,7 +646,7 @@ class Replay:
       chunk = slice(start, min(n, start + self.capacity))
       m = chunk.stop - chunk.start
       at = (self.pos + np.arange(m)) % self.capacity
-      for name in ('tokens', 'halfmove', 'legal', 'probs', 'wdl'):
+      for name in ('tokens', 'halfmove', 'legal', 'probs', 'weight', 'wdl'):
         getattr(self, name)[at] = record[name][chunk]
       self.pos = (self.pos + m) % self.capacity
       self.size = min(self.capacity, self.size + m)
@@ -632,29 +654,31 @@ class Replay:
   def sample(self, n, rng):
     at = rng.integers(0, self.size, n)
     return (self.tokens[at], self.halfmove[at], self.legal[at],
-            self.probs[at], self.wdl[at])
+            self.probs[at], self.weight[at], self.wdl[at])
 
 def to_device(batch, device):
-  tokens, halfmove, legal, probs, wdl = batch
+  tokens, halfmove, legal, probs, weight, wdl = batch
   pin = device.startswith('cuda')
   def move(a, dtype):
     t = torch.from_numpy(a).to(dtype)
     return t.pin_memory().to(device, non_blocking=True) if pin else t.to(device)
-  return (move(tokens, torch.long), move(halfmove, torch.float32),
-          move(legal, torch.long), move(probs, torch.float32), move(wdl, torch.long))
+  return (move(tokens, torch.long), move(halfmove, torch.float32), move(legal, torch.long),
+          move(probs, torch.float32), move(weight, torch.float32), move(wdl, torch.long))
 
 def losses(net, batch):
-  tokens, halfmove, legal, probs, wdl = batch
+  tokens, halfmove, legal, probs, weight, wdl = batch
   logits, wdl_logits = net(tokens, halfmove)
   # The policy is only trained over the legal moves: their logits are pulled
-  # out and softmaxed on their own, and padding (-1) is masked away.
+  # out and softmaxed on their own, and padding (-1) is masked away. Rows
+  # from quick searches have weight 0 and train the value head only.
   picked = logits.float().gather(1, legal.clamp(min=0))
   picked = picked.masked_fill(legal < 0, -1e9)
-  policy = -(probs * torch.log_softmax(picked, 1)).sum(1).mean()
+  rows = weight.sum().clamp(min=1)
+  policy = (weight * -(probs * torch.log_softmax(picked, 1)).sum(1)).sum() / rows
   value = F.cross_entropy(wdl_logits.float(), wdl)
   # What the policy loss would be if the net matched the search exactly, so
   # the log can show how far off it actually is.
-  entropy = -(probs * torch.log(probs.clamp(min=1e-12))).sum(1).mean()
+  entropy = (weight * -(probs * torch.log(probs.clamp(min=1e-12))).sum(1)).sum() / rows
   return policy, value, entropy
 
 class Stats:
@@ -671,12 +695,14 @@ class Stats:
     self.results = Counter()
     self.reasons = Counter()
     self.vs = {}           # opponent kind -> [games, score for us]
+    self.policy_rows = 0   # of the positions, those with a policy target
     self.steps = 0
     self.policy = self.value = self.entropy = 0.0
 
   def add_game(self, record):
     self.games += 1
     self.positions += record['positions']
+    self.policy_rows += record.get('policy_rows', 0)
     self.plies += record['plies']
     self.results[record['result']] += 1
     self.reasons[record['reason']] += 1
@@ -720,7 +746,12 @@ def main():
             f'to {previous}', flush=True)
   elif os.path.exists(checkpoint_path):
     checkpoint = torch_load(checkpoint_path, 'cpu')
-  config = checkpoint['config'] if checkpoint else {'width': args.width, 'blocks': args.blocks}
+  if checkpoint:
+    config = checkpoint['config']
+  elif args.arch == 'transformer':
+    config = {'arch': 'transformer', 'width': args.width, 'blocks': args.blocks, 'heads': args.heads}
+  else:
+    config = {'width': args.width, 'blocks': args.blocks}
   args.model_config = config
   net = RLNet(**config)
   opt = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -736,6 +767,29 @@ def main():
     games_total = checkpoint['games']
     positions_total = checkpoint['positions']
     print(f'resuming {checkpoint_path} at step {step:,} ({games_total:,} games so far)')
+  net.to(device)
+  # A running average of the weights is what leaves the learner: the actors
+  # play it, the evaluator measures it, snapshots and nighty_rl.pt are it.
+  # It moves more smoothly than the raw weights step to step, so self-play
+  # is not chasing every wobble of the optimizer.
+  averaged = [p.detach().clone() for p in net.parameters()] if args.ema > 0 else None
+  if averaged is not None and checkpoint and checkpoint.get('averaged') is not None:
+    for a, saved in zip(averaged, checkpoint['averaged']):
+      a.copy_(saved.to(device))
+
+  def published():
+    """The parameters the rest of the run sees."""
+    return averaged if averaged is not None else list(net.parameters())
+
+  def published_net():
+    """A copy of the net carrying those parameters, for saving."""
+    if averaged is None:
+      return net
+    out = copy.deepcopy(net)
+    with torch.no_grad():
+      for p, a in zip(out.parameters(), averaged):
+        p.copy_(a)
+    return out
   net.to(device).train()
   n_params = sum(p.numel() for p in net.parameters())
   print(f'net {config}, {n_params / 1e6:.1f}M parameters; learner on {device}, '
@@ -801,9 +855,10 @@ def main():
   steps_run = fresh = 0
 
   def save(final=False):
-    save_net(net, weights_path)
+    save_net(published_net(), weights_path)
     tmp = checkpoint_path + '.tmp'
     state = {'config': net.config, 'state_dict': cpu_state(net),
+             'averaged': None if averaged is None else [a.cpu() for a in averaged],
              'optimizer': opt.state_dict(), 'step': step,
              'games': games_total, 'positions': positions_total}
     if args.wandb:
@@ -864,6 +919,7 @@ def main():
     if args.wandb:
       log = {'step': step, 'games': games_total, 'buffer': replay.size,
              'games_per_min': s.games * 60 / secs, 'positions_per_s': s.positions / secs,
+             'policy_positions_per_s': s.policy_rows / secs,
              'sims_per_s': sims_rate, 'plies': s.plies / games}
       if s.games:
         log.update({f'result/{k}': s.results[v] / s.games
@@ -939,6 +995,9 @@ def main():
           pass
         continue
 
+      if args.warmup and step < args.warmup:
+        for group in opt.param_groups:
+          group['lr'] = args.lr * (step + 1) / args.warmup
       batch = to_device(replay.sample(args.batch_size, rng), device)
       with autocast:
         policy, value, entropy = losses(net, batch)
@@ -946,19 +1005,21 @@ def main():
       (policy + value).backward()
       torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
       opt.step()
+      if averaged is not None:
+        torch._foreach_lerp_(averaged, [p.detach() for p in net.parameters()], 1 - args.ema)
       step += 1
       steps_run += 1
       step_now.value = step
       stats.add_step(policy.item(), value.item(), entropy.item())
 
       if step % args.publish_every == 0:
-        publish(net, shared, lock, version)
+        publish(published(), shared, lock, version)
       if time.time() - last_save >= args.save_minutes * 60:
         save()
         last_save = time.time()
       if args.snapshot_every and step % args.snapshot_every == 0:
         os.makedirs(snapshot_dir, exist_ok=True)
-        save_net(net, os.path.join(snapshot_dir, f'step_{step:07d}.pt'))
+        save_net(published_net(), os.path.join(snapshot_dir, f'step_{step:07d}.pt'))
   except KeyboardInterrupt:
     print('\nstopping...', flush=True)
   finally:
