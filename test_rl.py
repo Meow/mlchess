@@ -310,6 +310,21 @@ trained = load_net(weights).eval()
 
 
 section('arena')
+check('elo estimate follows the score', abs(rl_eval.elo_estimate(
+      {'games': 20, 'score': 0.75}, 1500) - (1500 + 400 * np.log10(3))) < 1e-6)
+check('a whitewash gives a bound, not infinity',
+      np.isfinite(rl_eval.elo_estimate({'games': 20, 'score': 0.0}, 1500)))
+if rl_eval.stockfish_path():
+  stockfish = rl_eval.stockfish_player(1000, 0.02)
+  try:
+    summary = rl_eval.play_match(rl_eval.MCTSPlayer(trained, 'cpu', sims=8, threads=2),
+                                 stockfish, games=2, max_plies=60)
+  finally:
+    stockfish.close()
+  check('plays a match against handicapped stockfish', summary['games'] == 2
+        and stockfish.elo >= 1000, f'(level {stockfish.elo}, {rl_eval.describe(summary)})')
+else:
+  print('  (no stockfish binary, so the stockfish opponent is not tested)')
 for name in backends:
   player = rl_eval.MCTSPlayer(trained, 'cpu', sims=8, backend=name, threads=2)
   summary = rl_eval.play_match(player, rl_eval.RandomPlayer(0), games=2, max_plies=40)

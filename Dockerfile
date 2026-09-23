@@ -25,7 +25,10 @@ RUN pip wheel --no-deps -w /wheels /src/rust
 
 # --- the image everything runs in --------------------------------------------
 FROM ${BASE}
-RUN pip install --no-cache-dir chess numpy safetensors wandb
+# Stockfish is the Elo yardstick (never an opponent in training).
+RUN apt-get update && apt-get install -y --no-install-recommends stockfish \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir chess numpy safetensors wandb
 COPY --from=build /wheels/nighty_rs-*.whl /tmp/
 RUN pip install --no-cache-dir /tmp/nighty_rs-*.whl && rm /tmp/nighty_rs-*.whl
 

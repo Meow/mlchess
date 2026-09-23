@@ -5,6 +5,7 @@ __pycache__
 .venv/
 rl_checkpoint.pt
 rl_snapshots/
+rl_previous_*/
 *.pt.tmp
 rust/target/
 .env

@@ -3,6 +3,7 @@
   python3 rl_eval.py                                  # nighty_rl.pt vs a 1-ply greedy player
   python3 rl_eval.py --opponent greedy:2 --games 40 --sims 400
   python3 rl_eval.py --opponent nightybot             # vs the imitation engine (run.py), over UCI
+  python3 rl_eval.py --opponent stockfish:1500          # Stockfish handicapped to 1500 (UCI_Elo)
   python3 rl_eval.py --opponent uci:stockfish --opponent-time 0.05
   python3 rl_eval.py --opponent rl:rl_snapshots/step_0010000.pt
 
@@ -16,6 +17,7 @@ import argparse
 import math
 import os
 import random
+import shutil
 import subprocess
 import sys
 import time
@@ -140,10 +142,12 @@ class GreedyPlayer:
     pass
 
 class UCIPlayer:
-  def __init__(self, command, seconds, cwd=None):
+  def __init__(self, command, seconds, cwd=None, options=None):
     import chess.engine
     self.engine = chess.engine.SimpleEngine.popen_uci(
       command, cwd=cwd, stderr=subprocess.DEVNULL, timeout=60)
+    if options:
+      self.engine.configure(options)
     self.limit = chess.engine.Limit(time=seconds)
 
   def choose(self, boards):
@@ -157,11 +161,38 @@ class UCIPlayer:
     except Exception:
       pass
 
+def stockfish_path():
+  return os.environ.get('STOCKFISH') or shutil.which('stockfish')
+
+def stockfish_player(elo, seconds):
+  """Stockfish held down to `elo` with its own UCI_LimitStrength handicap,
+  clamped to what the binary allows (1320-3190 in Stockfish 16+). The player
+  keeps the level it actually got as `.elo`."""
+  path = stockfish_path()
+  if not path:
+    raise FileNotFoundError('no stockfish binary: install it (brew/apt/dnf install stockfish) '
+                            'or set STOCKFISH=/path/to/it')
+  player = UCIPlayer([path], seconds)
+  option = player.engine.options['UCI_Elo']
+  player.elo = int(max(option.min, min(option.max, elo)))
+  player.engine.configure({'UCI_LimitStrength': True, 'UCI_Elo': player.elo})
+  return player
+
+def elo_estimate(summary, opponent_elo):
+  """Our Elo from a match score against an opponent of known Elo. A whitewash
+  either way is read as if one game had gone the other way, so it gives a
+  bound instead of infinity."""
+  n = summary['games']
+  score = min(max(summary['score'], 0.5 / n), 1 - 0.5 / n)
+  return opponent_elo + 400 * math.log10(score / (1 - score))
+
 def make_player(spec, device='cpu', sims=200, seconds=0.5, backend='auto'):
-  """random | greedy[:depth] | nightybot | uci:<command> | rl:<weights file>"""
+  """random | greedy[:depth] | nightybot | stockfish[:elo] | uci:<command> | rl:<weights file>"""
   kind, _, arg = spec.partition(':')
   if kind == 'random':
     return RandomPlayer()
+  if kind == 'stockfish':
+    return stockfish_player(int(arg) if arg else 1320, seconds)
   if kind == 'greedy':
     return GreedyPlayer(int(arg) if arg else 1)
   if kind == 'nightybot':
@@ -284,7 +315,10 @@ def main():
                          args.max_plies, seed=args.seed, on_game=on_game)
   finally:
     opponent.close()
-  print(f'{describe(summary)}   ({time.time() - started:.0f}s)')
+  line = describe(summary)
+  if hasattr(opponent, 'elo'):
+    line += f'   => about {elo_estimate(summary, opponent.elo):.0f} Elo (vs Stockfish at {opponent.elo})'
+  print(f'{line}   ({time.time() - started:.0f}s)')
 
 if __name__ == '__main__':
   main()

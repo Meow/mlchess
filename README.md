@@ -82,7 +82,7 @@ It starts from a blank net, so expect it to lose to everything for the first hou
 
 #### Opponents
 
-Pure self-play has a known weakness: a net that only ever plays its current self can forget how to beat its earlier selves and drift in circles. So each game is played against something drawn from a mix — `self` (both sides the current net), `snapshot` (an earlier net from `rl_snapshots/`, uniform over the newest eight), `random`, or `greedy` (the 1-ply `evaluation.py` player) — with a random colour. Only the current net's own moves become training rows; every game's result trains the value head. The mix slides from `--opponents` (default `self=0.7,snapshot=0.2,random=0.1`) to `--opponents-final` (default `self=0.7,snapshot=0.3`) over `--opponents-steps` training steps. The progress line then carries win rates per opponent (`vs random 96% snapshot 58%`), which is a strength meter you get for free; wandb has them as `vs/*`. `greedy` runs in Python and costs a millisecond or two per move, so keep its share small at thousands of games.
+Pure self-play has a known weakness: a net that only ever plays its current self can forget how to beat its earlier selves and drift in circles. So each game is played against something drawn from a mix — `self` (both sides the current net), `snapshot` (an earlier net from `rl_snapshots/`, uniform over the newest eight), `random`, or `greedy` (the 1-ply `evaluation.py` player) — with a random colour. Only the current net's own moves become training rows; every game's result trains the value head. The mix slides from `--opponents` (default `self=0.7,snapshot=0.2,random=0.1`) to `--opponents-final` (default `self=0.7,snapshot=0.3`) over `--opponents-steps` training steps. The progress line then carries win rates per opponent (`vs random 96% snapshot 58%`), which is a strength meter you get for free; wandb has them as `vs/*`. `greedy` runs in Python at a millisecond or two per move, and at 16k games a 10% share was measured to halve throughput: use `greedy=0.02` or so. `--fresh` moves the previous run's checkpoint, weights and snapshots to `rl_previous_<time>/` so a new net neither overwrites them nor trains against them.
 
 #### The Rust search
 
@@ -126,6 +126,8 @@ python3 rl_eval.py --opponent nightybot                  # vs the imitation engi
 python3 rl_eval.py --opponent rl:rl_snapshots/step_0010000.pt
 python3 rl_eval.py --opponent uci:stockfish --opponent-time 0.05
 ```
+
+Every 1000 training steps the evaluator also plays 20 games against [Stockfish](https://stockfishchess.org) held down with its own `UCI_Elo` handicap (`brew install stockfish` / `dnf install stockfish`; the Docker image has it), picks the level nearest the last estimate so the score stays informative, and logs the result as `eval/stockfish_elo` in wandb. That is the number to quote. Stockfish is only ever a yardstick, never an opponent in training: training against it would just be distilling Stockfish. `--stockfish-every 0` turns it off; `rl_eval.py --opponent stockfish:1500` runs one match by hand. Note the estimate is as good as Stockfish's handicap calibration, which assumes a normal time control; at `--stockfish-time 0.1` treat it as a consistent scale rather than a lichess rating.
 
 `python3 test_rl.py` checks all of this in about a minute without needing a trained model.
 

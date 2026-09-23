@@ -8,6 +8,7 @@ as a plain state_dict plus its constructor arguments, so the class below is the
 only definition there is and loading does not care what __main__ is.
 """
 
+import contextlib
 import os
 
 import chess
@@ -126,6 +127,15 @@ class Evaluator:
   def __init__(self, net, device):
     self.net = net
     self.device = device
+    # On CUDA the search's batches run in bfloat16: several times the
+    # throughput, and priors and values do not need more precision than
+    # that. MPS and CPU stay in fp32 (fp16 matmuls fail on MPS in torch 2.8).
+    cuda = str(device).startswith('cuda')
+    self.autocast = (torch.autocast('cuda', dtype=torch.bfloat16) if cuda and torch.cuda.is_bf16_supported()
+                     else contextlib.nullcontext())
+    if cuda:
+      torch.backends.cuda.matmul.allow_tf32 = True
+      torch.backends.cudnn.allow_tf32 = True
 
   def __call__(self, tokens, halfmove, indices):
     """indices is (batch, M): each row's legal move indices, padded with 0.
@@ -136,10 +146,11 @@ class Evaluator:
   # with two batches can submit one, prepare the other, and only then fetch.
   @torch.inference_mode()
   def submit(self, tokens, halfmove, indices):
-    logits, wdl = self.net(
-      torch.from_numpy(tokens).to(self.device),
-      torch.from_numpy(halfmove).to(self.device)
-    )
+    with self.autocast:
+      logits, wdl = self.net(
+        torch.from_numpy(tokens).to(self.device),
+        torch.from_numpy(halfmove).to(self.device)
+      )
     # Pull out the legal moves' logits before leaving the device: it is ~30
     # numbers per row, against 4168 for the whole head.
     picked = logits.gather(1, torch.from_numpy(indices).to(self.device))

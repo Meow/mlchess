@@ -110,7 +110,8 @@ def parse_args(argv=None):
   g.add_argument('--opponents', default='self=0.7,snapshot=0.2,random=0.1',
                  help='what each game is played against, with weights: self (both sides the '
                       'current net), snapshot (an earlier net from rl_snapshots/), random, greedy '
-                      '(1-ply evaluation.py, slow in Python: keep its share small)')
+                      '(1-ply evaluation.py; it runs in Python at ~1 ms a move, so at thousands of '
+                      'games a 10%% share halves throughput -- use 0.02 or so)')
   g.add_argument('--opponents-final', default='self=0.7,snapshot=0.3',
                  help='the mix at --opponents-steps and after; interpolated linearly until then')
   g.add_argument('--opponents-steps', type=int, default=20000)
@@ -143,6 +144,11 @@ def parse_args(argv=None):
                  help='random | greedy[:depth] | nightybot | uci:<command> | rl:<weights>')
   g.add_argument('--eval-games', type=int, default=20)
   g.add_argument('--eval-sims', type=int, default=100)
+  g.add_argument('--stockfish-every', type=int, default=1000,
+                 help='training steps between Elo measurements against a handicapped Stockfish '
+                      '(never trained on); 0 turns them off. Needs a stockfish binary.')
+  g.add_argument('--stockfish-games', type=int, default=20)
+  g.add_argument('--stockfish-time', type=float, default=0.1, help="Stockfish's seconds per move")
 
   g = p.add_argument_group('output')
   g.add_argument('--out-dir', default=os.path.dirname(os.path.abspath(__file__)))
@@ -155,7 +161,8 @@ def parse_args(argv=None):
   g.add_argument('--max-minutes', type=float, default=0,
                  help='stop after this long, e.g. 480 for overnight; 0 runs until Ctrl-C')
   g.add_argument('--fresh', action='store_true',
-                 help='start from a new net even if there is a checkpoint')
+                 help='start from a new net; the existing checkpoint, weights and snapshots '
+                      'are moved to rl_previous_<time>/ first')
   g.add_argument('--wandb', action='store_true',
                  help='log to Weights & Biases (pip3 install wandb; wandb login). A resumed '
                       'checkpoint continues its run. Set WANDB_MODE=offline to log locally.')
@@ -467,6 +474,16 @@ def actor_main(rank, args, shared, lock, version, games_q, sims, resign_on, step
   pool = OpponentPool(args, device, rng, os.path.join(args.out_dir, 'rl_snapshots'))
   games = [SelfPlayGame(args, rng, resign_on, backend, pool, step_now.value)
            for _ in range(args.games_per_actor)]
+  by_tree = {}   # (backend id, tree id) -> game index, for games that are searching
+  idle = set()   # games whose side to move does not search (random, greedy)
+  def track(n):
+    game = games[n]
+    if game.mover_backend() is None:
+      idle.add(n)
+    else:
+      by_tree[(id(game.tree_backend), game.tree.id)] = n
+  for n in range(len(games)):
+    track(n)
 
   # Games are not kept in step with each other: whenever one finishes its
   # search it plays its move and starts the next, so every step() has a leaf
@@ -476,14 +493,26 @@ def actor_main(rank, args, shared, lock, version, games_q, sims, resign_on, step
       seen = pull(net, shared, lock, version)
     pool.refresh()
     backends = [backend] + pool.backends()
-    done = {id(b): b.done_ids() for b in backends}
-    for n, game in enumerate(games):
-      if game.ready(done):
-        record = game.play_move()
-        if record is not None:
-          record['version'] = seen
-          games_q.put(record)
-          games[n] = SelfPlayGame(args, rng, resign_on, backend, pool, step_now.value)
+    # Only the games with a move to play: with thousands of games in flight
+    # that is a few percent of them, and asking every one costs more than
+    # the moves do.
+    ready = list(idle)
+    for b in backends:
+      done = b.done_ids()
+      if done is None:
+        done = [t for (bid, t) in by_tree if bid == id(b) and games[by_tree[(bid, t)]].tree.done()]
+      for t in done:
+        n = by_tree.pop((id(b), t), None)
+        if n is not None:
+          ready.append(n)
+    idle.clear()
+    for n in ready:
+      record = games[n].play_move()
+      if record is not None:
+        record['version'] = seen
+        games_q.put(record)
+        games[n] = SelfPlayGame(args, rng, resign_on, backend, pool, step_now.value)
+      track(n)
     for b in backends:
       b.step(None)
     # Live, rather than counted off finished games, which would read low for
@@ -492,25 +521,59 @@ def actor_main(rank, args, shared, lock, version, games_q, sims, resign_on, step
   # Don't let unread records hold up this process's exit.
   games_q.cancel_join_thread()
 
-def evaluator_main(args, shared, lock, version, results_q, stop):
+def evaluator_main(args, shared, lock, version, results_q, step_now, stop):
+  """Two yardsticks, in one process so they never compete with each other:
+  the fixed --eval-opponent every --eval-every minutes, and a handicapped
+  Stockfish every --stockfish-every steps for an Elo number. Stockfish is
+  measured against, never trained against -- otherwise the net would just be
+  learning to be Stockfish."""
   signal.signal(signal.SIGINT, signal.SIG_IGN)
   torch.set_num_threads(1)
   net = RLNet(**args.model_config).eval()
   opponent = rl_eval.make_player(args.eval_opponent, 'cpu', args.eval_sims)
+  stockfish_at = args.stockfish_every if args.stockfish_every > 0 else None
+  if stockfish_at and not rl_eval.stockfish_path():
+    print('no stockfish binary found, so no Elo measurements (install it or set STOCKFISH)',
+          flush=True)
+    stockfish_at = None
+  # Start against the weakest level Stockfish offers, then follow the net up:
+  # a match only says something when the score is not 0% or 100%.
+  level = 1320
+  next_stockfish = (step_now.value // args.stockfish_every + 1) * args.stockfish_every if stockfish_at else None
+
+  def match(against, games, seen):
+    player = rl_eval.MCTSPlayer(net, 'cpu', args.eval_sims, args.c_puct, args.fpu_reduction,
+                                backend=args.backend, threads=2)
+    started = time.time()
+    summary = rl_eval.play_match(player, against, games, seed=seen, should_stop=stop.is_set)
+    if summary is not None:
+      summary.update(version=seen, seconds=time.time() - started)
+    return summary
+
   try:
     due = time.time()
     while not stop.wait(timeout=2.0):
+      if next_stockfish is not None and step_now.value >= next_stockfish:
+        seen = pull(net, shared, lock, version)
+        stockfish = rl_eval.stockfish_player(level, args.stockfish_time)
+        try:
+          summary = match(stockfish, args.stockfish_games, seen)
+        finally:
+          stockfish.close()
+        if summary is None:
+          break
+        estimate = rl_eval.elo_estimate(summary, stockfish.elo)
+        summary.update(kind='stockfish', level=stockfish.elo, estimate=estimate, step=step_now.value)
+        results_q.put(summary)
+        level = int(round(estimate / 50) * 50)
+        next_stockfish = (step_now.value // args.stockfish_every + 1) * args.stockfish_every
       if time.time() < due:
         continue
       seen = pull(net, shared, lock, version)
-      player = rl_eval.MCTSPlayer(net, 'cpu', args.eval_sims, args.c_puct, args.fpu_reduction,
-                                  backend=args.backend, threads=2)
-      started = time.time()
-      summary = rl_eval.play_match(player, opponent, args.eval_games,
-                                   seed=seen, should_stop=stop.is_set)
+      summary = match(opponent, args.eval_games, seen)
       if summary is None:
         break
-      summary.update(version=seen, seconds=time.time() - started)
+      summary['kind'] = 'fixed'
       results_q.put(summary)
       due = time.time() + args.eval_every * 60
   finally:
@@ -620,7 +683,19 @@ def main():
     torch.manual_seed(args.seed)
 
   checkpoint = None
-  if not args.fresh and os.path.exists(checkpoint_path):
+  if args.fresh:
+    # A fresh net should not be overwriting the previous run's weights at its
+    # first save, nor playing the previous run's snapshots as if they were its
+    # own past: move that run out of the way, whole.
+    old = [p for p in (checkpoint_path, weights_path, snapshot_dir) if os.path.exists(p)]
+    if old:
+      previous = os.path.join(args.out_dir, 'rl_previous_' + time.strftime('%Y%m%d_%H%M%S'))
+      os.makedirs(previous)
+      for p in old:
+        os.replace(p, os.path.join(previous, os.path.basename(p)))
+      print(f'--fresh: moved the previous run ({", ".join(os.path.basename(p) for p in old)}) '
+            f'to {previous}', flush=True)
+  elif os.path.exists(checkpoint_path):
     checkpoint = torch_load(checkpoint_path, 'cpu')
   config = checkpoint['config'] if checkpoint else {'width': args.width, 'blocks': args.blocks}
   args.model_config = config
@@ -647,6 +722,8 @@ def main():
 
   if device.startswith('cuda') and torch.cuda.is_bf16_supported():
     autocast = torch.autocast('cuda', dtype=torch.bfloat16)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
   else:
     autocast = contextlib.nullcontext()
 
@@ -691,7 +768,7 @@ def main():
   helpers = []
   if args.eval_every > 0:
     helpers.append(ctx.Process(target=evaluator_main, name='evaluator', daemon=True,
-                               args=(args, shared, lock, version, eval_q, stop)))
+                               args=(args, shared, lock, version, eval_q, step_now, stop)))
   for proc in actors + helpers:
     proc.start()
 
@@ -797,6 +874,15 @@ def main():
           result = eval_q.get_nowait()
         except queue.Empty:
           break
+        if result['kind'] == 'stockfish':
+          print(f'elo vs stockfish@{result["level"]} (net v{result["version"]}, '
+                f'{args.eval_sims} sims): {rl_eval.describe(result)}  '
+                f'=> about {result["estimate"]:.0f} Elo  [{result["seconds"]:.0f}s]', flush=True)
+          if args.wandb:
+            wandb.log({'step': step, 'eval/stockfish_elo': result['estimate'],
+                       'eval/stockfish_level': result['level'],
+                       'eval/stockfish_score': result['score']})
+          continue
         print(f'eval vs {args.eval_opponent} (net v{result["version"]}, '
               f'{args.eval_sims} sims): {rl_eval.describe(result)}  '
               f'[{result["seconds"]:.0f}s]', flush=True)
