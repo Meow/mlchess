@@ -80,6 +80,10 @@ It starts from a blank net, so expect it to lose to everything for the first hou
 - **The learner** trains on the GPU while the games are being played. It uses CUDA, or MPS on a Mac, and hands new weights to the actors through shared memory.
 - **An evaluator** process plays the current net against a fixed opponent every 20 minutes, so you can see whether it's improving.
 
+#### Opponents
+
+Pure self-play has a known weakness: a net that only ever plays its current self can forget how to beat its earlier selves and drift in circles. So each game is played against something drawn from a mix — `self` (both sides the current net), `snapshot` (an earlier net from `rl_snapshots/`, uniform over the newest eight), `random`, or `greedy` (the 1-ply `evaluation.py` player) — with a random colour. Only the current net's own moves become training rows; every game's result trains the value head. The mix slides from `--opponents` (default `self=0.7,snapshot=0.2,random=0.1`) to `--opponents-final` (default `self=0.7,snapshot=0.3`) over `--opponents-steps` training steps. The progress line then carries win rates per opponent (`vs random 96% snapshot 58%`), which is a strength meter you get for free; wandb has them as `vs/*`. `greedy` runs in Python and costs a millisecond or two per move, so keep its share small at thousands of games.
+
 #### The Rust search
 
 The per-simulation work (move generation, encoding, PUCT selection, backup) is also implemented in Rust, in `rust/`, behind exactly the same interface (`rl_backend.py`). Everything picks it up automatically once it is built, and `--backend python` gets the pure-Python one back. To build it you need a Rust toolchain ([rustup](https://rustup.rs)); pip does the rest, and it must be the same `python3` you run the scripts with:

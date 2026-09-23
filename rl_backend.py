@@ -63,11 +63,16 @@ class PythonBackend:
   def __init__(self, net, device, c_puct, fpu_reduction, seed):
     self.rng = np.random.default_rng(seed)
     self.mcts = rl_mcts.MCTS(Evaluator(net, device), c_puct, fpu_reduction, self.rng)
+    self.live = []  # trees not yet closed, for step(None)
 
   def tree(self, board):
-    return PythonTree(self, board)
+    tree = PythonTree(self, board)
+    self.live.append(tree)
+    return tree
 
-  def step(self, trees, leaves_per_tree=1):
+  def step(self, trees=None, leaves_per_tree=1):
+    if trees is None:
+      trees = self.live
     return self.mcts.step([t.tree for t in trees], leaves_per_tree)
 
   def run(self, trees, leaves_per_tree=1):
@@ -77,6 +82,10 @@ class PythonBackend:
   def finished(self, trees):
     """Indices into `trees` of the searches that have reached their target."""
     return [n for n, t in enumerate(trees) if t.done()]
+
+  def done_ids(self):
+    """Ids of finished searches, or None when trees must be asked one by one."""
+    return None
 
   def set_c_puct(self, value):
     self.mcts.c_puct = value
@@ -108,6 +117,10 @@ class PythonTree:
 
   def done(self):
     return self.tree.sims >= self.tree.target
+
+  @property
+  def id(self):
+    return id(self)
 
   def expanded(self):
     return self.tree.root.P is not None
@@ -149,7 +162,10 @@ class PythonTree:
     return self.board.ply()
 
   def close(self):
-    pass
+    try:
+      self.backend.live.remove(self)
+    except ValueError:
+      pass
 
 # --- Rust ---------------------------------------------------------------------
 
@@ -163,7 +179,11 @@ class RustBackend:
 
   def __init__(self, net, device, c_puct, fpu_reduction, seed, threads):
     self.evaluate = Evaluator(net, device)
-    self.searcher = nighty_rs.Searcher(c_puct, fpu_reduction, seed, threads)
+    # Every searcher in the process shares rayon's global pool; the first one
+    # to ask sizes it (0 leaves it at every core).
+    if threads:
+      nighty_rs.set_threads(threads)
+    self.searcher = nighty_rs.Searcher(c_puct, fpu_reduction, seed, 0)
 
   def tree(self, board):
     return RustTree(self, self.searcher, board)
@@ -188,8 +208,11 @@ class RustBackend:
   def finished(self, trees):
     # One call for all of them: asking each of thousands of trees in turn was
     # a measurable slice of every step.
-    done = set(self.searcher.done())
+    done = self.done_ids()
     return [n for n, t in enumerate(trees) if t.id in done]
+
+  def done_ids(self):
+    return set(self.searcher.done())
 
   def set_c_puct(self, value):
     self.searcher.set_c_puct(value)
@@ -207,7 +230,17 @@ class RustTree:
     self.backend = backend
     self.searcher = searcher
     self.board = board
-    self.id = self.searcher.new_tree(board.root().fen(), [m.uci() for m in board.move_stack])
+    # Only the moves since the last capture or pawn move go to Rust: nothing
+    # before them can take part in a repetition, and walking a whole game's
+    # move stack for every new tree adds up when trees are made per move.
+    k = min(board.halfmove_clock, len(board.move_stack))
+    if k:
+      recent = board.copy(stack=k)
+      start = recent.root().fen()
+      moves = [m.uci() for m in recent.move_stack]
+    else:
+      start, moves = board.fen(), []
+    self.id = self.searcher.new_tree(start, moves)
     self.target = 0
     self._moves = None
 

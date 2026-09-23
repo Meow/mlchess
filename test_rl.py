@@ -232,6 +232,40 @@ check('policy targets are distributions over legal moves only',
 check('value targets agree with the result',
       set(record['wdl']) <= ({1} if record['result'] == 0 else {0, 2}))
 
+# An opponent pool: a snapshot of the net on disk, plus random and greedy.
+pool_dir = tempfile.mkdtemp(prefix='nighty_rl_pool_')
+os.makedirs(os.path.join(pool_dir, 'rl_snapshots'))
+from rl_model import save_net
+save_net(net, os.path.join(pool_dir, 'rl_snapshots', 'step_0000001.pt'))
+pool_args = train_rl.parse_args(['--sims', '8', '--fast-sims', '4', '--max-plies', '30', '--resign', '-1',
+                                 '--backend', backends[-1], '--out-dir', pool_dir,
+                                 '--opponents', 'self=1,snapshot=1,random=1,greedy=1',
+                                 '--opponents-final', 'self=1', '--opponents-steps', '10'])
+pool = train_rl.OpponentPool(pool_args, 'cpu', rng, os.path.join(pool_dir, 'rl_snapshots'))
+check('the pool loads the snapshot', len(pool.snapshots) == 1)
+mix = train_rl.mix_at(pool_args, 5)
+check('the opponent mix slides towards --opponents-final',
+      abs(mix['self'] - 0.625) < 1e-6 and abs(mix['greedy'] - 0.125) < 1e-6, f'({mix})')
+pool_games = [train_rl.SelfPlayGame(pool_args, rng, Flag(), game_backend, pool, 0) for _ in range(12)]
+seen = {}
+while len(seen) < 4 and sum(1 for g in pool_games if g is not None) and len(seen) < 4:
+  everything = [game_backend] + pool.backends()
+  done = {id(b): b.done_ids() for b in everything}
+  for j, g in enumerate(pool_games):
+    if g is not None and g.ready(done):
+      rec = g.play_move()
+      if rec is not None:
+        seen.setdefault(rec['opponent'], rec)
+        pool_games[j] = train_rl.SelfPlayGame(pool_args, rng, Flag(), game_backend, pool, 0)
+  for b in everything:
+    b.step(None)
+check('games finish against every kind of opponent', set(seen) == set(train_rl.OPPONENT_KINDS),
+      f'({sorted(seen)})')
+check('only the current net\'s own moves become rows',
+      all(r['positions'] <= (r['plies'] + 1) // 2 + 1 for k, r in seen.items() if k != 'self'))
+check('pool games report our score', all(seen[k]['ours'] in (-1, 0, 1) for k in seen if k != 'self')
+      and seen['self']['ours'] is None)
+
 replay = train_rl.Replay(50)
 for _ in range(4):
   replay.add(record)
@@ -266,7 +300,9 @@ for name in backends:
 weights = os.path.join(tmp, 'nighty_rl.pt')
 check('it writes the weights and a checkpoint',
       os.path.exists(weights) and os.path.exists(os.path.join(tmp, 'rl_checkpoint.pt')))
-p = subprocess.run(cmd + ['--max-steps', '3'], capture_output=True, text=True, timeout=600)
+p = subprocess.run(cmd + ['--max-steps', '3', '--snapshot-every', '2',
+                          '--opponents', 'self=0.4,snapshot=0.3,random=0.2,greedy=0.1'],
+                   capture_output=True, text=True, timeout=600)
 resumed = p.returncode == 0 and 'resuming' in p.stdout and 'at step 8' in p.stdout
 check('a second run resumes from the checkpoint', resumed,
       '' if resumed else (p.stdout + p.stderr).strip()[-300:])

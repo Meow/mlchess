@@ -114,6 +114,9 @@ struct Tree {
     nodes: Vec<Node>,
     root: u32,
     pos: Chess,
+    /// Plies played before `history[0]`, so ply() is the game's, not the
+    /// tree's: a tree may be started from the last irreversible move only.
+    ply_base: usize,
     /// Zobrist hashes of every position the game has been through, the
     /// current one last, so the search can see a repetition of one of them.
     history: Vec<u64>,
@@ -133,10 +136,13 @@ enum Walk {
 
 impl Tree {
     fn new(pos: Chess, history: Vec<u64>, seed: u64) -> Tree {
+        let ply_base = 2 * (pos.fullmoves().get() as usize - 1) + (pos.turn() == Color::Black) as usize
+            + 1 - history.len();
         Tree {
             nodes: vec![Node::default()],
             root: 0,
             pos,
+            ply_base,
             history,
             target: 0,
             sims: 0,
@@ -428,7 +434,10 @@ struct Searcher {
     c_puct: f32,
     fpu_reduction: f32,
     rng: StdRng,
-    pool: rayon::ThreadPool,
+    /// Own thread pool, or None for rayon's global one (see set_threads),
+    /// which several searchers in one process share instead of each
+    /// spinning up a full set of threads and fighting over the cores.
+    pool: Option<rayon::ThreadPool>,
     /// Trees with leaves in the batch handed out by the last collect(), in
     /// batch order, so apply() can hand the rows back.
     batched: Vec<usize>,
@@ -445,10 +454,14 @@ impl Searcher {
     #[new]
     #[pyo3(signature = (c_puct=1.75, fpu_reduction=0.25, seed=None, threads=0))]
     fn new(c_puct: f32, fpu_reduction: f32, seed: Option<u64>, threads: usize) -> PyResult<Self> {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build()
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let pool = if threads == 0 {
+            None
+        } else {
+            Some(rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .map_err(|e| PyValueError::new_err(e.to_string()))?)
+        };
         let rng = match seed {
             Some(s) => StdRng::seed_from_u64(s),
             None => StdRng::from_entropy(),
@@ -516,7 +529,7 @@ impl Searcher {
         let trees = &mut self.trees;
         let pool = &self.pool;
         let sims: u64 = py.allow_threads(|| {
-            pool.install(|| {
+            install(pool, || {
                 trees
                     .par_iter_mut()
                     .map(|slot| {
@@ -609,7 +622,7 @@ impl Searcher {
         }
         let pool = &self.pool;
         py.allow_threads(|| {
-            pool.install(|| {
+            install(pool, || {
                 work.into_par_iter().for_each(|(tree, off)| {
                     let pending = std::mem::take(&mut tree.pending);
                     for (j, leaf) in pending.into_iter().enumerate() {
@@ -756,7 +769,8 @@ impl Searcher {
     }
 
     fn ply(&self, id: usize) -> PyResult<usize> {
-        Ok(self.tree(id)?.history.len() - 1)
+        let tree = self.tree(id)?;
+        Ok(tree.ply_base + tree.history.len() - 1)
     }
 
     fn white_to_move(&self, id: usize) -> PyResult<bool> {
@@ -781,6 +795,20 @@ impl Searcher {
     fn tree_mut(&mut self, id: usize) -> PyResult<&mut Tree> {
         self.trees.get_mut(id).and_then(|t| t.as_mut()).ok_or_else(|| PyValueError::new_err("no such tree"))
     }
+}
+
+fn install<R: Send>(pool: &Option<rayon::ThreadPool>, work: impl FnOnce() -> R + Send) -> R {
+    match pool {
+        Some(p) => p.install(work),
+        None => work(),
+    }
+}
+
+/// Size rayon's global pool, which every Searcher made with threads=0 uses.
+/// Only the first call in a process counts; later ones are ignored.
+#[pyfunction]
+fn set_threads(threads: usize) -> bool {
+    rayon::ThreadPoolBuilder::new().num_threads(threads).build_global().is_ok()
 }
 
 fn parse_move(pos: &Chess, uci: &str) -> PyResult<Move> {
@@ -817,6 +845,7 @@ fn nighty_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Searcher>()?;
     m.add_function(wrap_pyfunction!(encode_fen, m)?)?;
     m.add_function(wrap_pyfunction!(legal_moves_fen, m)?)?;
+    m.add_function(wrap_pyfunction!(set_threads, m)?)?;
     m.add("N_MOVES", 4096 + 72)?;
     Ok(())
 }

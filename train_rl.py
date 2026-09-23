@@ -48,7 +48,8 @@ from torch.nn.utils import parameters_to_vector, vector_to_parameters
 
 import rl_eval
 from rl_backend import make_backend, rust_available
-from rl_model import RLNet, cpu_state, pick_device, save_net, torch_load
+from rl_mcts import game_over
+from rl_model import RLNet, cpu_state, load_net, pick_device, save_net, torch_load
 
 # Training rows keep at most this many moves. No position from a real game
 # comes near it (the record is 218, and ~40 is typical); past it, the least
@@ -105,6 +106,19 @@ def parse_args(argv=None):
                  help='resigning is only allowed while the measured rate of wrong resignations '
                       'is below this')
 
+  g = p.add_argument_group('opponents')
+  g.add_argument('--opponents', default='self=0.7,snapshot=0.2,random=0.1',
+                 help='what each game is played against, with weights: self (both sides the '
+                      'current net), snapshot (an earlier net from rl_snapshots/), random, greedy '
+                      '(1-ply evaluation.py, slow in Python: keep its share small)')
+  g.add_argument('--opponents-final', default='self=0.7,snapshot=0.3',
+                 help='the mix at --opponents-steps and after; interpolated linearly until then')
+  g.add_argument('--opponents-steps', type=int, default=20000)
+  g.add_argument('--snapshot-pool', type=int, default=8,
+                 help='how many of the newest snapshots opponents are drawn from')
+  g.add_argument('--snapshot-refresh', type=float, default=5,
+                 help='minutes between looks at rl_snapshots/ for new ones')
+
   g = p.add_argument_group('model (ignored when resuming: the checkpoint wins)')
   g.add_argument('--width', type=int, default=512)
   g.add_argument('--blocks', type=int, default=4)
@@ -133,8 +147,8 @@ def parse_args(argv=None):
   g = p.add_argument_group('output')
   g.add_argument('--out-dir', default=os.path.dirname(os.path.abspath(__file__)))
   g.add_argument('--save-every', type=int, default=1000, help='steps between checkpoints')
-  g.add_argument('--snapshot-every', type=int, default=10000,
-                 help='steps between copies kept in rl_snapshots/; 0 keeps none')
+  g.add_argument('--snapshot-every', type=int, default=5000,
+                 help='steps between copies kept in rl_snapshots/ (also the opponent pool); 0 keeps none')
   g.add_argument('--log-every', type=float, default=30, help='seconds between progress lines')
   g.add_argument('--max-steps', type=int, default=0,
                  help='stop after this many training steps in this run; 0 runs until Ctrl-C')
@@ -169,7 +183,29 @@ def parse_args(argv=None):
     args.games_per_actor = 4096 if rust else 48
   if rust and args.actor_threads == 0:
     args.actor_threads = max(1, cores // args.actors)
+  args.opponents = parse_mix(args.opponents)
+  args.opponents_final = parse_mix(args.opponents_final)
   return args
+
+OPPONENT_KINDS = ('self', 'snapshot', 'random', 'greedy')
+
+def parse_mix(spec):
+  """'self=0.7,snapshot=0.3' -> {'self': 0.7, 'snapshot': 0.3, ...}, normalised."""
+  mix = {kind: 0.0 for kind in OPPONENT_KINDS}
+  for part in spec.split(','):
+    kind, _, weight = part.partition('=')
+    if kind.strip() not in mix:
+      raise SystemExit(f'unknown opponent {kind!r}; choose from {", ".join(OPPONENT_KINDS)}')
+    mix[kind.strip()] = float(weight or 1)
+  total = sum(mix.values())
+  if total <= 0:
+    raise SystemExit('the opponent mix needs at least one positive weight')
+  return {k: v / total for k, v in mix.items()}
+
+def mix_at(args, step):
+  """The opponent mix for a training step: --opponents sliding to --opponents-final."""
+  t = 1.0 if args.opponents_steps <= 0 else min(1.0, step / args.opponents_steps)
+  return {k: (1 - t) * args.opponents[k] + t * args.opponents_final[k] for k in OPPONENT_KINDS}
 
 # --- weights, shared between processes ----------------------------------------
 #
@@ -205,54 +241,160 @@ def adjudicate(board, margin):
     return 0, 'max-plies'
   return (1 if score > 0 else -1), 'adjudicated'
 
+class OpponentPool:
+  """What a game can be played against besides the current net: earlier nets
+  from rl_snapshots/ (each with its own search backend), a random mover, or
+  the 1-ply greedy player from rl_eval.py.
+
+  Playing only against itself, a net can forget how to beat what it used to
+  be and drift in circles; a mix of old selves and fixed players keeps the
+  games varied and gives a strength meter for free (the win rates in the
+  progress line)."""
+
+  def __init__(self, args, device, rng, snapshot_dir):
+    self.args = args
+    self.device = device
+    self.rng = rng
+    self.snapshot_dir = snapshot_dir
+    self.snapshots = {}      # file name -> backend playing that net
+    self.greedy = rl_eval.GreedyPlayer(1)
+    self.checked = 0.0
+    self.refresh()
+
+  def refresh(self):
+    if time.time() - self.checked < self.args.snapshot_refresh * 60 and self.checked:
+      return
+    self.checked = time.time()
+    try:
+      names = sorted(n for n in os.listdir(self.snapshot_dir) if n.endswith('.pt'))
+    except FileNotFoundError:
+      names = []
+    names = names[-self.args.snapshot_pool:]
+    for name in list(self.snapshots):
+      if name not in names:
+        del self.snapshots[name]
+    for name in names:
+      if name not in self.snapshots:
+        try:
+          net = load_net(os.path.join(self.snapshot_dir, name), self.device).eval()
+        except Exception as e:  # half-written, or from another net shape
+          print(f'skipping snapshot {name}: {e}', flush=True)
+          continue
+        self.snapshots[name] = make_backend(self.args.backend, net, self.device,
+                                            self.args.c_puct, self.args.fpu_reduction)
+
+  def backends(self):
+    return list(self.snapshots.values())
+
+  def choose(self, step):
+    """(kind, backend or None) for a new game."""
+    mix = mix_at(self.args, step)
+    kind = self.rng.choice(OPPONENT_KINDS, p=[mix[k] for k in OPPONENT_KINDS])
+    if kind == 'snapshot':
+      if not self.snapshots:
+        return 'self', None
+      name = self.rng.choice(sorted(self.snapshots))
+      return 'snapshot', self.snapshots[name]
+    return str(kind), None
+
 class SelfPlayGame:
   """One game in progress inside an actor, and the training rows it has
-  produced so far."""
+  produced so far. The current net plays both sides, or one side against an
+  opponent from the pool; only the current net's own moves become rows."""
 
-  def __init__(self, args, rng, resign_on, backend):
+  def __init__(self, args, rng, resign_on, backend, pool=None, step=0):
     self.args = args
     self.rng = rng
     self.resign_on = resign_on  # shared flag the learner sets, see actor_main
-    self.tree = backend.tree(chess.Board())
+    self.backend = backend
+    self.pool = pool
+    self.kind, self.opponent = pool.choose(step) if pool else ('self', None)
+    self.us = chess.WHITE if self.kind == 'self' or rng.random() < 0.5 else chess.BLACK
+    self.board = chess.Board()
+    self.tree = None
+    self.tree_backend = None
     self.rows = []
     self.may_resign = rng.random() >= args.no_resign_frac
     self.would_resign = set()   # colours that crossed the threshold in a no-resign game
     self.start_search()
 
+  def ours(self):
+    return self.kind == 'self' or self.board.turn == self.us
+
+  def mover_backend(self):
+    """The search backend for the side to move; None if it does not search."""
+    if self.ours():
+      return self.backend
+    return self.opponent if self.kind == 'snapshot' else None
+
   def start_search(self):
+    a = self.args
+    backend = self.mover_backend()
+    if backend is None:
+      self.full = False
+      return
+    # The tree lives on from move to move while the same net is searching;
+    # when the other side's net takes over it starts afresh from the board.
+    if self.tree_backend is not backend:
+      if self.tree is not None:
+        self.tree.close()
+      self.tree = backend.tree(self.board)
+      self.tree_backend = backend
     # Playout cap randomisation (KataGo): most moves get a quick search that
     # only keeps the game going, a few get a full one that becomes a training
     # row. More finished games per hour, which is what the value head eats.
-    a = self.args
-    self.full = self.rng.random() < a.full_prob
+    # Opponents only ever get the quick search, and no noise.
+    self.full = self.ours() and self.rng.random() < a.full_prob
     noise = (a.dirichlet_alpha, a.dirichlet_frac) if self.full else None
     self.tree.reset_search(a.sims if self.full else a.fast_sims, noise)
 
+  def ready(self, done_ids):
+    """Is there a move to play? done_ids maps a backend to its finished tree
+    ids (or None, meaning ask the tree)."""
+    if self.mover_backend() is None:
+      return True
+    done = done_ids.get(id(self.tree_backend))
+    return self.tree.done() if done is None else self.tree.id in done
+
   def search_done(self):
-    return self.tree.done()
+    return self.ready({})
 
   def play_move(self):
     """Record the finished search, play a move, and return the game's record
     if that was the end of it."""
     a = self.args
-    tree = self.tree
-    turn = tree.board.turn
-    visits = tree.visits()
-    if self.full and visits.sum() > 0:
-      self.rows.append(training_row(tree, visits, turn))
+    board = self.board
+    turn = board.turn
+    if self.mover_backend() is None:
+      if self.kind == 'greedy':
+        move = self.pool.greedy.best(board)
+      else:
+        legal = list(board.legal_moves)
+        move = legal[self.rng.integers(len(legal))]
+      # Through our tree if we have one, so it stays on the same position as
+      # the board (and keeps what it searched below this move).
+      if self.tree is not None:
+        self.tree.advance(move)
+        over = self.tree.game_over()
+      else:
+        board.push(move)
+        over = game_over(board)
+    else:
+      tree = self.tree
+      visits = tree.visits()
+      if self.full and visits.sum() > 0:
+        self.rows.append(training_row(tree, visits, turn))
+      if self.ours() and tree.q(tree.best()) < a.resign:
+        if self.may_resign and self.resign_on.value:
+          return self.finish(-1 if turn == chess.WHITE else 1, 'resign')
+        if not self.may_resign:
+          self.would_resign.add(turn)
+      temperature = 1.0 if board.ply() < a.temp_plies else 0.0
+      tree.advance(tree.moves()[tree.sample(temperature)])
+      over = tree.game_over()
 
-    if tree.q(tree.best()) < a.resign:
-      if self.may_resign and self.resign_on.value:
-        return self.finish(-1 if turn == chess.WHITE else 1, 'resign')
-      if not self.may_resign:
-        self.would_resign.add(turn)
-
-    temperature = 1.0 if tree.ply() < a.temp_plies else 0.0
-    tree.advance(tree.moves()[tree.sample(temperature)])
-
-    over = tree.game_over()
-    if over is None and tree.ply() >= a.max_plies:
-      over = adjudicate(tree.board, a.adjudicate_cp)
+    if over is None and board.ply() >= a.max_plies:
+      over = adjudicate(board, a.adjudicate_cp)
     if over is not None:
       return self.finish(*over)
     self.start_search()
@@ -261,10 +403,14 @@ class SelfPlayGame:
   def finish(self, result, reason):
     """Package the game for the learner. result is White's score: 1, 0, -1."""
     n = len(self.rows)
-    plies = self.tree.ply()
-    self.tree.close()
+    plies = self.board.ply()
+    if self.tree is not None:
+      self.tree.close()
+      self.tree = None
     record = {'result': result, 'reason': reason, 'plies': plies,
-              'positions': n,
+              'positions': n, 'opponent': self.kind,
+              # our score against a pool opponent, for the win rates
+              'ours': None if self.kind == 'self' else result * (1 if self.us == chess.WHITE else -1),
               # for each side that would have resigned: did it actually lose?
               'resign_checks': [result == (-1 if colour == chess.WHITE else 1)
                                 for colour in self.would_resign]}
@@ -302,7 +448,7 @@ def actor_device(name, rank, backend='python'):
     return f'cuda:{rank % torch.cuda.device_count()}'
   return pick_device('auto') if backend == 'rust' else 'cpu'
 
-def actor_main(rank, args, shared, lock, version, games_q, sims, resign_on, stop):
+def actor_main(rank, args, shared, lock, version, games_q, sims, resign_on, step_now, stop):
   # Ctrl-C reaches every process in the group; the learner handles it and
   # tells the actors to stop through `stop`.
   signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -318,7 +464,9 @@ def actor_main(rank, args, shared, lock, version, games_q, sims, resign_on, stop
   backend = make_backend(args.backend, net, device, args.c_puct, args.fpu_reduction,
                          seed=None if args.seed is None else args.seed * 1000 + rank,
                          threads=args.actor_threads)
-  games = [SelfPlayGame(args, rng, resign_on, backend) for _ in range(args.games_per_actor)]
+  pool = OpponentPool(args, device, rng, os.path.join(args.out_dir, 'rl_snapshots'))
+  games = [SelfPlayGame(args, rng, resign_on, backend, pool, step_now.value)
+           for _ in range(args.games_per_actor)]
 
   # Games are not kept in step with each other: whenever one finishes its
   # search it plays its move and starts the next, so every step() has a leaf
@@ -326,17 +474,21 @@ def actor_main(rank, args, shared, lock, version, games_q, sims, resign_on, stop
   while not stop.is_set():
     if version.value != seen:
       seen = pull(net, shared, lock, version)
-    trees = [game.tree for game in games]
-    for n in backend.finished(trees):
-      record = games[n].play_move()
-      if record is not None:
-        record['version'] = seen
-        games_q.put(record)
-        games[n] = SelfPlayGame(args, rng, resign_on, backend)
-    backend.step(trees)
+    pool.refresh()
+    backends = [backend] + pool.backends()
+    done = {id(b): b.done_ids() for b in backends}
+    for n, game in enumerate(games):
+      if game.ready(done):
+        record = game.play_move()
+        if record is not None:
+          record['version'] = seen
+          games_q.put(record)
+          games[n] = SelfPlayGame(args, rng, resign_on, backend, pool, step_now.value)
+    for b in backends:
+      b.step(None)
     # Live, rather than counted off finished games, which would read low for
     # the first few minutes while every game is still in progress.
-    sims[rank] = backend.sims
+    sims[rank] = sum(b.sims for b in backends)
   # Don't let unread records hold up this process's exit.
   games_q.cancel_join_thread()
 
@@ -432,6 +584,7 @@ class Stats:
     self.plies = 0
     self.results = Counter()
     self.reasons = Counter()
+    self.vs = {}           # opponent kind -> [games, score for us]
     self.steps = 0
     self.policy = self.value = self.entropy = 0.0
 
@@ -441,6 +594,10 @@ class Stats:
     self.plies += record['plies']
     self.results[record['result']] += 1
     self.reasons[record['reason']] += 1
+    if record.get('ours') is not None:
+      tally = self.vs.setdefault(record['opponent'], [0, 0.0])
+      tally[0] += 1
+      tally[1] += (record['ours'] + 1) / 2
 
   def add_step(self, policy, value, entropy):
     self.steps += 1
@@ -523,11 +680,13 @@ def main():
   # the time, so it stays off until the games that may never resign show the
   # net would have been right often enough (--resign-false-max).
   resign_on = ctx.Value('i', 0)
+  step_now = ctx.Value('q', step)  # actors read it to pick the opponent mix
   resign_checks = deque(maxlen=200)
   eval_q = ctx.Queue()
 
   actors = [ctx.Process(target=actor_main, name=f'actor-{rank}', daemon=True,
-                        args=(rank, args, shared, lock, version, games_q, sims, resign_on, stop))
+                        args=(rank, args, shared, lock, version, games_q, sims, resign_on,
+                              step_now, stop))
             for rank in range(args.actors)]
   helpers = []
   if args.eval_every > 0:
@@ -591,6 +750,8 @@ def main():
       w, d, b = (s.results[k] * 100 // s.games for k in (1, 0, -1))
       ends = ' '.join(f'{k} {v * 100 // s.games}%' for k, v in s.reasons.most_common())
       line += f' | W/D/B {w}/{d}/{b}% | {ends}'
+    if s.vs:
+      line += ' | vs ' + ' '.join(f'{k} {v[1] * 100 / v[0]:.0f}%' for k, v in sorted(s.vs.items()))
     if resign_checks:
       wrong = 1 - sum(resign_checks) / len(resign_checks)
       line += f' | resign {"on" if resign_on.value else "off"} (wrong {wrong * 100:.0f}%)'
@@ -608,6 +769,8 @@ def main():
         log.update({f'result/{k}': s.results[v] / s.games
                     for k, v in (('white', 1), ('draw', 0), ('black', -1))})
         log.update({f'end/{k}': v / s.games for k, v in s.reasons.items()})
+      log.update({f'vs/{k}': v[1] / v[0] for k, v in s.vs.items()})
+      log.update({f'opponents/{k}': v for k, v in mix_at(args, step).items()})
       if resign_checks:
         log['resign/wrong'] = 1 - sum(resign_checks) / len(resign_checks)
         log['resign/on'] = int(resign_on.value)
@@ -676,6 +839,7 @@ def main():
       opt.step()
       step += 1
       steps_run += 1
+      step_now.value = step
       stats.add_step(policy.item(), value.item(), entropy.item())
 
       if step % args.publish_every == 0:
