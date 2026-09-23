@@ -1,0 +1,21 @@
+[package]
+name = "nightybot"
+version = "0.1.0"
+edition = "2021"
+description = "NightyBot's imitation-learned UCI engine (run.py) as a standalone binary"
+
+[[bin]]
+name = "nightybot"
+path = "src/main.rs"
+
+[dependencies]
+shakmaty = "0.27"
+serde_json = "1"
+libm = "0.2"
+# only for ../rust/src/classical.rs, which this crate includes for eval_pos
+rand = "0.8"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1

@@ -8,4 +8,5 @@ rl_snapshots/
 rl_previous_*/
 *.pt.tmp
 rust/target/
+engine/target/
 .env

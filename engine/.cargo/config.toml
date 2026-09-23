@@ -1,0 +1,4 @@
+[build]
+# The nets are two dense MLPs run on the CPU; let the dot-product kernel use
+# whatever vector width this machine has (AVX2/AVX-512 on the Linux box).
+rustflags = ["-C", "target-cpu=native"]

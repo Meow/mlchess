@@ -13,6 +13,9 @@ No linter or build step exists. Everything is run directly with `python3`.
 ```bash
 pip3 install torch numpy safetensors wandb chess   # deps are NOT installed in this checkout
 python3 run.py            # UCI engine, reads commands on stdin (./run.sh is the lichess-bot entry point)
+cargo build --release --manifest-path engine/Cargo.toml   # the same engine as a Rust binary; run.sh prefers it once built
+engine/target/release/nightybot bench 4   # nodes/s at fixed depth; `logits FEN` / `candidates FEN` dump the nets
+python3 test_engine_rs.py # checks the Rust engine against run.py (logits, shortlists, moves) and over UCI
 python3 test_engine.py    # sanity checks for the evaluation and the search
 python3 train5.py         # train the "to" model  -> chess5.model
 python3 train_from.py     # train the "from" model -> chess_from.model
@@ -36,7 +39,8 @@ position startpos moves e2e4 e7e5
 go wtime 60000 btime 60000 winc 1000 binc 1000
 ```
 
-`test_engine.py` loads the real checkpoints and plays out short searches, so it takes a few seconds to start and around a minute to run. It is the fastest way to tell whether a change to `evaluation.py` or the search broke something: it covers material ordering, the colour-mirror antisymmetry of `eval_pos`, promotion, mate scoring, stalemate and repetition handling, the time budget, and the UCI loop.
+`test_engine.py` loads the real checkpoints and plays out short searches, so it takes a few seconds to start and around a minute to run.
+`test_engine_rs.py` does the same for the Rust binary and additionally diffs it against run.py position by position, so it needs `chess.safetensors` / `chess_from.safetensors` to be exports of the current `.model` files (rerun `save.py` after retraining). It is the fastest way to tell whether a change to `evaluation.py` or the search broke something: it covers material ordering, the colour-mirror antisymmetry of `eval_pos`, promotion, mate scoring, stalemate and repetition handling, the time budget, and the UCI loop.
 
 Both training scripts train in an infinite loop and autosave every 10000 steps; stop them with Ctrl-C. `train5.py` calls `wandb.init` unconditionally — comment it out (as `train_from.py` already does) or it will crash without a wandb login. Both also hardcode the PGN path (`/home/luna/Downloads/lichess_db_standard_rated_2023-10.pgn`), which must be edited before training.
 
@@ -53,6 +57,16 @@ Two models, both 1 input layer + 3 residual middle layers (620 features, GELU + 
 - `search()` is a plain negamax over that shortlist, scoring leaves with `eval_pos` from [evaluation.py](evaluation.py) (piece-square tables adapted from [blunder](https://github.com/algerbrex/blunder), MIT). Every node returns its score from the point of view of the side to move, and the caller negates.
 - `find_best_move()` runs iterative deepening up to `search_depth`, fanning the root moves out over `threading.Thread`s. Each completed depth replaces the previous answer, so running out of time costs accuracy instead of the move. An iteration that does not finish is discarded whole.
 - Time control comes from `go`: `time_budget()` reads `wtime`/`btime`/`winc`/`binc`/`movestogo`/`movetime` and returns a per-move budget. `search_depth`, `search_moves` and `search_pieces` at the top of the file are the ceilings, not the target — with a clock the engine usually stops short of them.
+
+### Rust build of the engine (`engine/`)
+
+[engine/](engine/) is run.py as one binary, `nightybot`: the same nets run on the CPU from the safetensors exports ([engine/src/net.rs](engine/src/net.rs)), the same shortlist, search and time control ([engine/src/search.rs](engine/src/search.rs)), the same UCI loop ([engine/src/main.rs](engine/src/main.rs)). On the M5 Pro it searches ~60k nodes/s against ~7k for run.py (whose root threads are serialised by the GIL), so it completes depth 5 in half a second and depth 6 on a few-minute clock; its default `Depth` ceiling is 7 where run.py's is 5.
+
+- **It is meant to give the same answer as run.py at the same depth**, and `test_engine_rs.py` checks that it does: both nets' logits agree with torch to ~1e-5, the shortlists are identical, and best move and score match at equal depth. The one thing it adds is alpha-beta inside each root subtree, which returns the same values (root children get a full window, ties go to the first candidate either way) for a fraction of the nodes. Keep it that way: a behaviour change belongs in both engines or in neither.
+- **The evaluation is not duplicated.** `main.rs` includes `../rust/src/classical.rs` and `tables.rs` from the RL crate by `#[path]`, so `evaluation.py` → `rust/gen_tables.py` → both Rust engines is the only chain. The crate is separate from `rust/` because that one is a PyO3 cdylib that cannot also link as a normal binary.
+- **Weights come from `save.py`, not the `.model` files.** The binary looks for the two `.safetensors` in the working directory, then next to itself and up to four directories up, or takes `--models DIR`. Retrain → rerun `save.py`, or the Rust engine keeps playing the old nets while the tests report a mismatch.
+- **shakmaty refuses a position where the side not to move is in check** (python-chess did not care). Other oddities in a FEN — stale castling rights, impossible material — are ignored as python-chess ignored them. `test_engine.py`'s stalemate-trap position is one of those illegal ones; `test_engine_rs.py` uses a legal version.
+- **`stop` interrupts a search; `quit` and end of input interrupt only `go infinite`.** stdin is read on a thread. A piped `go` + `quit` (or a pipe that just closes) still gets its full search, the same rule run_rl.py follows.
 
 ### Gotchas
 
@@ -95,4 +109,4 @@ With the Rust search, self-play is bound by inference: ~180–200k simulations/s
 
 ## Layout
 
-`experiments/` holds superseded training scripts and checkpoints (`train.py`–`train4.py`, smaller/narrower nets); 620x3 beat the 512x2 variant. Nothing in the live pipeline imports from it. `chess.safetensors` / `chess_from.safetensors` are `save.py` exports for consumption by a separate Rust implementation, and are not read by any Python here — note that the Rust port reimplements the evaluation, so the table-indexing fixes described above have to be carried across by hand.
+`experiments/` holds superseded training scripts and checkpoints (`train.py`–`train4.py`, smaller/narrower nets); 620x3 beat the 512x2 variant. Nothing in the live pipeline imports from it. `chess.safetensors` / `chess_from.safetensors` are `save.py` exports; nothing in Python reads them, `engine/` (the Rust build of the imitation engine, above) does. `engine/target/` and `rust/target/` are build output.
