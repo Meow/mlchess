@@ -2,6 +2,7 @@
 
   python3 rl_eval.py                                  # nighty_rl.pt vs a 1-ply greedy player
   python3 rl_eval.py --opponent greedy:2 --games 40 --sims 400
+  python3 rl_eval.py --opponent classical:3               # the Rust alpha-beta over evaluation.py
   python3 rl_eval.py --opponent nightybot             # vs the imitation engine (run.py), over UCI
   python3 rl_eval.py --opponent stockfish:1500          # Stockfish handicapped to 1500 (UCI_Elo)
   python3 rl_eval.py --opponent uci:stockfish --opponent-time 0.05
@@ -141,6 +142,38 @@ class GreedyPlayer:
   def close(self):
     pass
 
+class ClassicalPlayer:
+  """The small classical engine in nighty_rs: evaluation.py's evaluation
+  under a shallow alpha-beta, searched in parallel for a whole list of boards.
+  A different kind of opponent from any net -- materialist, tactically sharp
+  to its horizon and blind past it -- and cheap enough to be a real share of
+  self-play. Falls back to GreedyPlayer without the Rust build."""
+
+  def __init__(self, depth=2, seed=0):
+    import rl_backend
+    self.depth = depth
+    self.seed = seed
+    self.fallback = None if rl_backend.rust_available() else GreedyPlayer(depth)
+
+  def choose(self, boards):
+    if self.fallback is not None:
+      return self.fallback.choose(boards)
+    import nighty_rs
+    positions = []
+    for board in boards:
+      k = min(board.halfmove_clock, len(board.move_stack))
+      if k:
+        recent = board.copy(stack=k)
+        positions.append((recent.root().fen(), [m.uci() for m in recent.move_stack]))
+      else:
+        positions.append((board.fen(), []))
+    self.seed += len(boards)
+    return [chess.Move(f, t, promotion=p or None)
+            for f, t, p in nighty_rs.classical_moves(positions, self.depth, self.seed)]
+
+  def close(self):
+    pass
+
 class UCIPlayer:
   def __init__(self, command, seconds, cwd=None, options=None):
     import chess.engine
@@ -197,7 +230,7 @@ def elo_estimate(summary, opponent_elo):
   return opponent_elo + 400 * math.log10(score / (1 - score))
 
 def make_player(spec, device='cpu', sims=200, seconds=0.5, backend='auto'):
-  """random | greedy[:depth] | nightybot | stockfish[:elo] | uci:<command> | rl:<weights file>"""
+  """random | greedy[:depth] | classical[:depth] | nightybot | stockfish[:elo] | uci:<command> | rl:<weights file>"""
   kind, _, arg = spec.partition(':')
   if kind == 'random':
     return RandomPlayer()
@@ -205,6 +238,8 @@ def make_player(spec, device='cpu', sims=200, seconds=0.5, backend='auto'):
     return stockfish_player(int(arg) if arg else 1320, seconds)
   if kind == 'greedy':
     return GreedyPlayer(int(arg) if arg else 1)
+  if kind == 'classical':
+    return ClassicalPlayer(int(arg) if arg else 2)
   if kind == 'nightybot':
     return UCIPlayer([sys.executable, os.path.join(HERE, 'run.py')], seconds, cwd=HERE)
   if kind == 'uci':

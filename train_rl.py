@@ -107,13 +107,15 @@ def parse_args(argv=None):
                       'is below this')
 
   g = p.add_argument_group('opponents')
-  g.add_argument('--opponents', default='self=0.7,snapshot=0.2,random=0.1',
+  g.add_argument('--opponents', default='self=0.6,snapshot=0.2,classical=0.1,random=0.1',
                  help='what each game is played against, with weights: self (both sides the '
-                      'current net), snapshot (an earlier net from rl_snapshots/), random, greedy '
-                      '(1-ply evaluation.py; it runs in Python at ~1 ms a move, so at thousands of '
-                      'games a 10%% share halves throughput -- use 0.02 or so)')
-  g.add_argument('--opponents-final', default='self=0.7,snapshot=0.3',
+                      'current net), snapshot (an earlier net from rl_snapshots/), classical (the '
+                      'Rust alpha-beta over evaluation.py, --classical-depth plies), random, and '
+                      'greedy (the same idea in Python, 1 ply, ~1 ms a move: keep its share tiny)')
+  g.add_argument('--opponents-final', default='self=0.7,snapshot=0.2,classical=0.1',
                  help='the mix at --opponents-steps and after; interpolated linearly until then')
+  g.add_argument('--classical-depth', type=int, default=2,
+                 help='plies the classical opponent looks ahead; 3 is noticeably stronger and slower')
   g.add_argument('--opponents-steps', type=int, default=20000)
   g.add_argument('--snapshot-pool', type=int, default=8,
                  help='how many of the newest snapshots opponents are drawn from')
@@ -196,7 +198,7 @@ def parse_args(argv=None):
   args.opponents_final = parse_mix(args.opponents_final)
   return args
 
-OPPONENT_KINDS = ('self', 'snapshot', 'random', 'greedy')
+OPPONENT_KINDS = ('self', 'snapshot', 'classical', 'random', 'greedy')
 
 def parse_mix(spec):
   """'self=0.7,snapshot=0.3' -> {'self': 0.7, 'snapshot': 0.3, ...}, normalised."""
@@ -267,6 +269,7 @@ class OpponentPool:
     self.snapshot_dir = snapshot_dir
     self.snapshots = {}      # file name -> backend playing that net
     self.greedy = rl_eval.GreedyPlayer(1)
+    self.classical = rl_eval.ClassicalPlayer(args.classical_depth, seed=int(rng.integers(1 << 30)))
     self.checked = 0.0
     self.refresh()
 
@@ -368,15 +371,20 @@ class SelfPlayGame:
   def search_done(self):
     return self.ready({})
 
-  def play_move(self):
+  def play_move(self, move=None):
     """Record the finished search, play a move, and return the game's record
-    if that was the end of it."""
+    if that was the end of it. `move` is for a mover that does not search and
+    has been asked in a batch already (the classical engine)."""
     a = self.args
     board = self.board
     turn = board.turn
     if self.mover_backend() is None:
-      if self.kind == 'greedy':
+      if move is not None:
+        pass
+      elif self.kind == 'greedy':
         move = self.pool.greedy.best(board)
+      elif self.kind == 'classical':
+        move = self.pool.classical.choose([board])[0]
       else:
         legal = list(board.legal_moves)
         move = legal[self.rng.integers(len(legal))]
@@ -508,8 +516,12 @@ def actor_main(rank, args, shared, lock, version, games_q, sims, resign_on, step
         if n is not None:
           ready.append(n)
     idle.clear()
+    # The classical engine searches all of its moves for this step at once,
+    # on every core, instead of one game at a time.
+    classical = [n for n in ready if games[n].kind == 'classical' and games[n].mover_backend() is None]
+    chosen = dict(zip(classical, pool.classical.choose([games[n].board for n in classical]))) if classical else {}
     for n in ready:
-      record = games[n].play_move()
+      record = games[n].play_move(chosen.get(n))
       if record is not None:
         record['version'] = seen
         games_q.put(record)

@@ -164,6 +164,18 @@ if rl_backend.rust_available():
       mismatches += 1
   check('Rust and Python agree on every token and move index', mismatches == 0,
         f'({mismatches} positions differ)')
+  from evaluation import eval_pos
+  differ = 0
+  for board in random_positions(3000, 21):
+    fen = board.fen()
+    for side in (0, 1):
+      if nighty_rs.evaluate_fen(fen, side) != eval_pos(rl_eval.fen_order(board), side):
+        differ += 1
+  check('the Rust evaluation matches evaluation.py to the centipawn', differ == 0,
+        f'({differ} scores differ)')
+  classical = rl_eval.ClassicalPlayer(2)
+  summary = rl_eval.play_match(classical, rl_eval.RandomPlayer(1), games=6, max_plies=200)
+  check('the classical engine beats a random mover', summary['score'] >= 0.9, rl_eval.describe(summary))
 
 for name in backends:
   section(f'search through the {name} backend')
@@ -239,16 +251,16 @@ from rl_model import save_net
 save_net(net, os.path.join(pool_dir, 'rl_snapshots', 'step_0000001.pt'))
 pool_args = train_rl.parse_args(['--sims', '8', '--fast-sims', '4', '--max-plies', '30', '--resign', '-1',
                                  '--backend', backends[-1], '--out-dir', pool_dir,
-                                 '--opponents', 'self=1,snapshot=1,random=1,greedy=1',
+                                 '--opponents', 'self=1,snapshot=1,random=1,greedy=1,classical=1',
                                  '--opponents-final', 'self=1', '--opponents-steps', '10'])
 pool = train_rl.OpponentPool(pool_args, 'cpu', rng, os.path.join(pool_dir, 'rl_snapshots'))
 check('the pool loads the snapshot', len(pool.snapshots) == 1)
 mix = train_rl.mix_at(pool_args, 5)
 check('the opponent mix slides towards --opponents-final',
-      abs(mix['self'] - 0.625) < 1e-6 and abs(mix['greedy'] - 0.125) < 1e-6, f'({mix})')
+      abs(mix['self'] - 0.6) < 1e-6 and abs(mix['greedy'] - 0.1) < 1e-6, f'({mix})')
 pool_games = [train_rl.SelfPlayGame(pool_args, rng, Flag(), game_backend, pool, 0) for _ in range(12)]
 seen = {}
-while len(seen) < 4 and sum(1 for g in pool_games if g is not None) and len(seen) < 4:
+while len(seen) < len(train_rl.OPPONENT_KINDS):
   everything = [game_backend] + pool.backends()
   done = {id(b): b.done_ids() for b in everything}
   for j, g in enumerate(pool_games):
@@ -301,7 +313,7 @@ weights = os.path.join(tmp, 'nighty_rl.pt')
 check('it writes the weights and a checkpoint',
       os.path.exists(weights) and os.path.exists(os.path.join(tmp, 'rl_checkpoint.pt')))
 p = subprocess.run(cmd + ['--max-steps', '3', '--snapshot-every', '2',
-                          '--opponents', 'self=0.4,snapshot=0.3,random=0.2,greedy=0.1'],
+                          '--opponents', 'self=0.3,snapshot=0.3,classical=0.2,random=0.1,greedy=0.1'],
                    capture_output=True, text=True, timeout=600)
 resumed = p.returncode == 0 and 'resuming' in p.stdout and 'at step 8' in p.stdout
 check('a second run resumes from the checkpoint', resumed,

@@ -13,6 +13,9 @@
 //! repetition inside the tree is already a draw but the root never is.
 //! test_rl.py checks the encodings against the Python ones square by square.
 
+mod classical;
+mod tables;
+
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -804,6 +807,45 @@ fn install<R: Send>(pool: &Option<rayon::ThreadPool>, work: impl FnOnce() -> R +
     }
 }
 
+/// evaluation.py's eval_pos() for a FEN, side 1 = white: for checking the
+/// Rust port against the Python.
+#[pyfunction]
+fn evaluate_fen(fen: &str, side: usize) -> PyResult<i32> {
+    let pos = position(fen)?;
+    Ok(classical::evaluate(&classical::fen_order(&pos), side))
+}
+
+/// The classical engine's move for each position, searched in parallel.
+/// Positions are (fen, moves since it) like new_tree; `depth` plies of
+/// alpha-beta over evaluation.py's evaluation.
+#[pyfunction]
+#[pyo3(signature = (positions, depth=2, seed=0))]
+fn classical_moves(py: Python<'_>, positions: Vec<(String, Vec<String>)>, depth: u32, seed: u64)
+    -> PyResult<Vec<(u8, u8, u8)>> {
+    let mut games = Vec::with_capacity(positions.len());
+    for (fen, moves) in &positions {
+        let mut pos = position(fen)?;
+        let mut history = vec![hash_of(&pos)];
+        for uci in moves {
+            let m = parse_move(&pos, uci)?;
+            pos.play_unchecked(&m);
+            history.push(hash_of(&pos));
+        }
+        games.push((pos, history));
+    }
+    let chosen: Vec<Option<Move>> = py.allow_threads(|| {
+        games
+            .par_iter()
+            .enumerate()
+            .map(|(n, (pos, history))| classical::choose(pos, history, depth, seed.wrapping_add(n as u64)))
+            .collect()
+    });
+    chosen
+        .iter()
+        .map(|m| m.as_ref().map(plain).ok_or_else(|| PyValueError::new_err("no legal moves")))
+        .collect()
+}
+
 /// Size rayon's global pool, which every Searcher made with threads=0 uses.
 /// Only the first call in a process counts; later ones are ignored.
 #[pyfunction]
@@ -846,6 +888,8 @@ fn nighty_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(encode_fen, m)?)?;
     m.add_function(wrap_pyfunction!(legal_moves_fen, m)?)?;
     m.add_function(wrap_pyfunction!(set_threads, m)?)?;
+    m.add_function(wrap_pyfunction!(evaluate_fen, m)?)?;
+    m.add_function(wrap_pyfunction!(classical_moves, m)?)?;
     m.add("N_MOVES", 4096 + 72)?;
     Ok(())
 }
