@@ -142,8 +142,11 @@ def parse_args(argv=None):
   g = p.add_argument_group('evaluation')
   g.add_argument('--eval-every', type=float, default=20,
                  help='minutes between evaluation matches; 0 turns the evaluator off')
-  g.add_argument('--eval-opponent', default='greedy',
-                 help='random | greedy[:depth] | nightybot | uci:<command> | rl:<weights>')
+  g.add_argument('--eval-opponent', default='classical',
+                 help='random | greedy[:depth] | classical[:depth] | nightybot | uci:<command> | '
+                      'rl:<weights>. greedy saturates at 100%% within a few thousand steps; '
+                      'classical (2-ply) is the same yardstick as the vs/classical win rate, '
+                      'but at --eval-sims without exploration noise')
   g.add_argument('--eval-games', type=int, default=20)
   g.add_argument('--eval-sims', type=int, default=100)
   g.add_argument('--stockfish-every', type=int, default=1000,

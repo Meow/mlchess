@@ -329,7 +329,8 @@ def main():
                               formatter_class=argparse.RawDescriptionHelpFormatter)
   p.add_argument('--weights', default=os.path.join(HERE, 'nighty_rl.pt'))
   p.add_argument('--opponent', default='greedy',
-                 help='random | greedy[:depth] | nightybot | uci:<command> | rl:<weights>')
+                 help='random | greedy[:depth] | classical[:depth] | nightybot | stockfish[:elo] | '
+                      'uci:<command> | rl:<weights>')
   p.add_argument('--games', type=int, default=20)
   p.add_argument('--sims', type=int, default=200, help='simulations per move for the RL side(s)')
   p.add_argument('--opponent-time', type=float, default=0.5,

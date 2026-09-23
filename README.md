@@ -78,7 +78,7 @@ It starts from a blank net, so expect it to lose to everything for the first hou
 
 - **Self-play.** With the Rust search (below) two processes each play 4096 games at once: the tree search runs across the cores, and one forward pass on the GPU scores a position from every game. Two rather than one because each step is a chain (walk the trees, run the net, back up) and a second process fills the gaps the first leaves on the CPU and the GPU. Without the Rust search, all cores but two each run a Python process of 48 games.
 - **The learner** trains on the GPU while the games are being played. It uses CUDA, or MPS on a Mac, and hands new weights to the actors through shared memory.
-- **An evaluator** process plays the current net against a fixed opponent every 20 minutes, so you can see whether it's improving.
+- **An evaluator** process plays the current net against a fixed opponent (`--eval-opponent`, default the 2-ply classical engine) every 20 minutes, so you can see whether it's improving.
 
 #### Opponents
 
@@ -101,7 +101,7 @@ Progress lines look like this:
 
 ```
 step 529 | buffer 67,671 | games 1,818 (+252, 250.5/min) | positions/s 174 | sims/s 55,399 | plies 165 | W/D/B 30/28/40% | mate 30% resign 28% adjudicated 12% repetition 10% material 10% fifty 5% max-plies 2% | policy 2.879 (kl 0.277) value 0.449 | steps/s 1.4
-eval vs greedy (net v12, 100 sims): +2 =0 -18  score 10.0%  elo -382 +/- 254  [20s]
+eval vs classical (net v12, 100 sims): +2 =0 -18  score 10.0%  elo -382 +/- 254  [20s]
 ```
 
 (Those are from the first twelve minutes of a run on a 16-core Mac. `resign on/off (wrong N%)` also appears once there is data: resigning is only allowed while the games that may never resign show it would have been right at least 95% of the time, because a wrongly resigned game is a wrong training label — and a young value head gets that wrong about a third of the time.)
