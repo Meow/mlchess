@@ -221,6 +221,59 @@ for name in backends:
   for t in trees:
     t.close()
 
+if rl_backend.rust_available():
+  section('the Rust backend with two lanes (a net call in flight per lane)')
+  lanes = rl_backend.make_backend('rust', net, 'cpu', seed=3, threads=2, lanes=2)
+  trees = [lanes.tree(b.copy()) for b in random_positions(12, 3)]
+  check('trees are spread over both lanes', len({t.lane.index for t in trees}) == 2)
+  for n, t in enumerate(trees):
+    t.reset_search(20 + n * 10)
+  lanes.run(trees)
+  check('every tree gets its budget, with every leaf applied',
+        all(t.done() and abs(t.visits().sum() - (20 + n * 10 - 1)) < 1 for n, t in enumerate(trees))
+        and all(lane.handle is None for lane in lanes.lanes))
+  check('done_ids covers both lanes', lanes.done_ids() == {t.id for t in trees})
+  for t in trees:
+    t.close()
+  tree = lanes.tree(chess.Board())
+  tree.reset_search(200)
+  lanes.step([tree])   # collected and submitted, not yet applied
+  check('a tree with leaves out is not done', not tree.done() and tree.sims == 1 and tree.lane.handle is not None)
+  check('nor reported by done_ids', tree.id not in lanes.done_ids())
+  tree.advance(tree.moves()[tree.best()])   # a search cut short: settles the lane first
+  check('reading or advancing a tree with leaves out settles its lane',
+        tree.lane.handle is None and not tree.searcher.in_flight(tree.rid))
+  tree.reset_search(30)
+  lanes.run([tree])
+  check('and the search goes on from there', tree.done() and tree.sims == 30)
+  tree.close()
+  # The self-play loop of train_rl.py over two lanes: games only ever touch
+  # trees that are done, so no lane is ever settled early.
+  lane_args = train_rl.parse_args(['--sims', '8', '--fast-sims', '4', '--max-plies', '30', '--resign', '-1',
+                                   '--backend', 'rust'])
+  lane_rng = np.random.default_rng(4)
+  class Flag:
+    value = 1
+  lane_games = [train_rl.SelfPlayGame(lane_args, lane_rng, Flag(), lanes) for _ in range(8)]
+  finished = 0
+  early = 0
+  for _ in range(2000):
+    done = {id(lanes): lanes.done_ids()}
+    for j, g in enumerate(lane_games):
+      if g.ready(done):
+        early += g.tree.searcher.in_flight(g.tree.rid)
+        if g.play_move() is not None:
+          finished += 1
+          lane_games[j] = train_rl.SelfPlayGame(lane_args, lane_rng, Flag(), lanes)
+    lanes.step(None)
+    if finished >= 8:
+      break
+  check('self-play over two lanes finishes games', finished >= 8, f'({finished} games)')
+  check('and never plays a move with leaves still out', early == 0, f'({early} times)')
+  for g in lane_games:
+    if g.tree is not None:
+      g.tree.close()
+
 
 section('learning')
 args = train_rl.parse_args(['--sims', '16', '--fast-sims', '4', '--full-prob', '1',

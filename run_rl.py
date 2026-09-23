@@ -161,7 +161,7 @@ class Engine:
     while True:
       self.backend.step([tree], batch)
       now = time.time()
-      if stop_requested(infinite) or tree.sims >= tree.target:
+      if stop_requested(infinite) or tree.done():
         break
       if deadline is not None:
         if now >= deadline or self.settled(tree, started, now, deadline):

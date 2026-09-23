@@ -95,7 +95,7 @@ python3 test_rl.py          # checks the two agree on every token and move index
 
 (For hacking on the Rust itself, `pip3 install maturin` and `cd rust && maturin develop --release` rebuilds in place.) `train_rl.py` says which backend it is using on its first line; if it says `python` when you expected `rust`, the extension isn't installed for that interpreter.
 
-On an M5 Pro it moved self-play from ~65k simulations/s (16 Python processes on the CPU) to ~300k (two processes of 4096 games, net on the GPU; ~200k with one), and one search thread alone does ~44k against ~8k for a Python process. The net is now the limit, so this is where a bigger GPU pays. Each actor holds about 9 GB at 4096 games; `--actors 2 --games-per-actor 8192` reached ~340k here at twice that. Expect the machine to look half idle even so: the hand-offs between search, net and back-up are serial within each process.
+On an M5 Pro it moved self-play from ~65k simulations/s (16 Python processes on the CPU) to ~300k (two processes of 4096 games, net on the GPU; ~200k with one), and one search thread alone does ~44k against ~8k for a Python process. The net is now the limit, so this is where a bigger GPU pays. Each actor holds about 9 GB at 4096 games; `--actors 2 --games-per-actor 8192` reached ~340k here at twice that. The hand-offs between search, net and back-up are serial within a process, so on a Mac expect the machine to look half idle even so. On CUDA each actor splits its games over two searchers (`--actor-lanes`) and keeps one net call in flight per searcher, so the walk of one overlaps the forward pass of the other; MPS did not gain from it, since a call there has a ~1 ms floor and halving the batch costs more than the overlap wins.
 
 Progress lines look like this:
 

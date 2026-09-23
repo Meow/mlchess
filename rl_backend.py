@@ -39,14 +39,16 @@ BUILD_HINT = ('the Rust search is not built for this Python: '
 def rust_available():
   return nighty_rs is not None
 
-def make_backend(name, net, device, c_puct=1.75, fpu_reduction=0.25, seed=None, threads=0):
-  """name: 'auto', 'rust' or 'python'. threads is for Rust only (0 = all cores)."""
+def make_backend(name, net, device, c_puct=1.75, fpu_reduction=0.25, seed=None, threads=0, lanes=1):
+  """name: 'auto', 'rust' or 'python'. threads and lanes are for Rust only:
+  threads 0 = all cores; lanes is how many searchers the trees are spread
+  over, each with a net call in flight (see RustBackend)."""
   if name == 'auto':
     name = 'rust' if rust_available() else 'python'
   if name == 'rust':
     if nighty_rs is None:
       raise RuntimeError(BUILD_HINT)
-    return RustBackend(net, device, c_puct, fpu_reduction, seed, threads)
+    return RustBackend(net, device, c_puct, fpu_reduction, seed, threads, lanes)
   if name == 'python':
     return PythonBackend(net, device, c_puct, fpu_reduction, seed)
   raise ValueError(f'unknown backend {name!r}')
@@ -170,36 +172,67 @@ class PythonTree:
 # --- Rust ---------------------------------------------------------------------
 
 class RustBackend:
-  """One searcher for every tree of the process, one forward pass per step.
-  (Splitting the trees over two searchers so one batch could be on the GPU
-  while the other was walked was measured slower: two thread pools fight,
-  and the GPU cares more about batch size than about overlap.)"""
+  """The process's trees, spread over `lanes` searchers, with one net call in
+  flight per lane. A step is a chain -- walk the trees, run the net, back up
+  -- and with one searcher the cores idle while the GPU works and vice versa.
+  With two lanes the walk and back-up of one overlap the forward pass of the
+  other: submit() queues the net's work and only fetch() waits for it, so
+  each lane's batch is collected, submitted, and only picked up on the next
+  step, after the other lane has been walked. All lanes share rayon's global
+  pool, and are walked one after another, so they never fight for cores;
+  what a second lane costs is half the batch per GPU call, which a CUDA
+  card does not mind and MPS (a ~1 ms floor per call) does -- hence lanes=1
+  unless the actor is on CUDA.
+
+  The invariant that makes this safe: a tree with leaves out at the net is
+  not done (done() checks) and is not touched -- Python settles the lane
+  (applies its batch) before advancing, resetting or dropping such a tree,
+  and Rust refuses if it did not."""
 
   name = 'rust'
 
-  def __init__(self, net, device, c_puct, fpu_reduction, seed, threads):
+  def __init__(self, net, device, c_puct, fpu_reduction, seed, threads, lanes=1):
     self.evaluate = Evaluator(net, device)
     # Every searcher in the process shares rayon's global pool; the first one
     # to ask sizes it (0 leaves it at every core).
     if threads:
       nighty_rs.set_threads(threads)
-    self.searcher = nighty_rs.Searcher(c_puct, fpu_reduction, seed, 0)
+    self.lanes = [Lane(nighty_rs.Searcher(c_puct, fpu_reduction, None if seed is None else seed + i, 0))
+                  for i in range(max(1, lanes))]
+    self.next_lane = 0
 
   def tree(self, board):
-    return RustTree(self, self.searcher, board)
+    # Round robin keeps the lanes the same size, as games start and end.
+    lane = self.lanes[self.next_lane]
+    self.next_lane = (self.next_lane + 1) % len(self.lanes)
+    return RustTree(self, lane, board)
 
-  def step(self, trees, leaves_per_tree=1):
-    """One batch over every tree this backend holds (the `trees` argument is
-    only there to match PythonBackend: the searcher already knows them all).
-    Returns False, having done nothing, once none wants more simulations."""
-    if not self.searcher.busy():
-      return False
-    tokens, halfmove, indices = self.searcher.collect(leaves_per_tree)
-    if len(halfmove):
-      logits, values = self.evaluate(tokens, halfmove, indices)
-      self.searcher.apply(np.ascontiguousarray(logits, dtype=np.float32),
-                          np.ascontiguousarray(values, dtype=np.float32))
-    return True
+  def step(self, trees=None, leaves_per_tree=1):
+    """One batch for every lane this backend holds (the `trees` argument is
+    only there to match PythonBackend: the searchers already know them all).
+    Each lane first takes in the answers to its previous batch, then sends
+    the next. Returns False, having done nothing, once nothing is out at
+    the net and no tree wants more simulations."""
+    worked = False
+    for lane in self.lanes:
+      if lane.handle is not None:
+        self.settle(lane)
+        worked = True
+      if lane.searcher.busy():
+        tokens, halfmove, indices = lane.searcher.collect(leaves_per_tree)
+        if len(halfmove):
+          lane.handle = self.evaluate.submit(tokens, halfmove, indices)
+        worked = True
+    return worked
+
+  def settle(self, lane):
+    """Apply the lane's batch in flight, if any (waits for the GPU)."""
+    if lane.handle is None:
+      return
+    logits, values = self.evaluate.fetch(lane.handle)
+    lane.handle = None
+    lane.searcher.apply(np.ascontiguousarray(logits, dtype=np.float32),
+                        np.ascontiguousarray(values, dtype=np.float32))
 
   def run(self, trees, leaves_per_tree=1):
     while self.step(trees, leaves_per_tree):
@@ -212,23 +245,36 @@ class RustBackend:
     return [n for n, t in enumerate(trees) if t.id in done]
 
   def done_ids(self):
-    return set(self.searcher.done())
+    return {(lane.index, r) for lane in self.lanes for r in lane.searcher.done()}
 
   def set_c_puct(self, value):
-    self.searcher.set_c_puct(value)
+    for lane in self.lanes:
+      lane.searcher.set_c_puct(value)
 
   @property
   def sims(self):
-    return self.searcher.total_sims()
+    return sum(lane.searcher.total_sims() for lane in self.lanes)
 
   @property
   def evals(self):
-    return self.searcher.total_evals()
+    return sum(lane.searcher.total_evals() for lane in self.lanes)
+
+class Lane:
+  """A searcher and the handle of its batch at the net, if one is out."""
+  __slots__ = ('searcher', 'handle', 'index')
+  count = 0
+
+  def __init__(self, searcher):
+    self.searcher = searcher
+    self.handle = None
+    self.index = Lane.count   # distinct across the process, so tree ids are too
+    Lane.count += 1
 
 class RustTree:
-  def __init__(self, backend, searcher, board):
+  def __init__(self, backend, lane, board):
     self.backend = backend
-    self.searcher = searcher
+    self.lane = lane
+    self.searcher = lane.searcher
     self.board = board
     # Only the moves since the last capture or pawn move go to Rust: nothing
     # before them can take part in a repetition, and walking a whole game's
@@ -240,27 +286,39 @@ class RustTree:
       moves = [m.uci() for m in recent.move_stack]
     else:
       start, moves = board.fen(), []
-    self.id = self.searcher.new_tree(start, moves)
+    self.rid = self.searcher.new_tree(start, moves)
+    self.id = (lane.index, self.rid)
     self.target = 0
     self._moves = None
 
+  def _settled(self):
+    """Take in this tree's leaves at the net, if any, before reading or
+    changing its root. In self-play a tree is only touched once done, when
+    nothing of it is out; this is for a search stopped part way (the engine
+    on `stop`, or a clock)."""
+    if self.lane.handle is not None and self.searcher.in_flight(self.rid):
+      self.backend.settle(self.lane)
+
   def reset_search(self, target, noise=None):
+    self._settled()
     alpha, fraction = noise if noise else (0.0, 0.0)
-    self.searcher.reset_search(self.id, target, alpha, fraction)
+    self.searcher.reset_search(self.rid, target, alpha, fraction)
     self.target = target
 
   @property
   def sims(self):
-    return self.searcher.sims(self.id)
+    return self.searcher.sims(self.rid)
 
   def done(self):
-    return self.searcher.sims(self.id) >= self.target
+    """Reached its target, with every leaf's answer backed up."""
+    return self.searcher.sims(self.rid) >= self.target and not self.searcher.in_flight(self.rid)
 
   def expanded(self):
-    return self.searcher.expanded(self.id)
+    return self.searcher.expanded(self.rid)
 
   def _root(self):
-    triples, N, Q, P = self.searcher.root(self.id)
+    self._settled()
+    triples, N, Q, P = self.searcher.root(self.rid)
     self._moves = [to_move(t) for t in triples]
     return N, Q, P
 
@@ -276,33 +334,39 @@ class RustTree:
     return float(self._root()[1][i])
 
   def best(self, random_ties=False):
-    return self.searcher.best_child(self.id, random_ties)
+    self._settled()
+    return self.searcher.best_child(self.rid, random_ties)
 
   def sample(self, temperature):
-    return self.searcher.sample_child(self.id, temperature)
+    self._settled()
+    return self.searcher.sample_child(self.rid, temperature)
 
   def advance(self, move):
-    self.searcher.advance(self.id, move.uci())
+    self._settled()
+    self.searcher.advance(self.rid, move.uci())
     self.board.push(move)
     self._moves = None
 
   def pv(self):
-    return [to_move(t) for t in self.searcher.pv(self.id)]
+    self._settled()
+    return [to_move(t) for t in self.searcher.pv(self.rid)]
 
   def mate_in(self):
-    return self.searcher.mate_in(self.id)
+    self._settled()
+    return self.searcher.mate_in(self.rid)
 
   def encoding(self):
-    tokens, halfmove, indices = self.searcher.root_encoding(self.id)
+    tokens, halfmove, indices = self.searcher.root_encoding(self.rid)
     return tokens, halfmove, indices
 
   def game_over(self):
-    return self.searcher.game_over(self.id)
+    return self.searcher.game_over(self.rid)
 
   def ply(self):
-    return self.searcher.ply(self.id)
+    return self.searcher.ply(self.rid)
 
   def close(self):
-    if self.id is not None:
-      self.searcher.drop_tree(self.id)
-      self.id = None
+    if self.rid is not None:
+      self._settled()
+      self.searcher.drop_tree(self.rid)
+      self.rid = None

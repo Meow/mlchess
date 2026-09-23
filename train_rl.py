@@ -76,6 +76,9 @@ def parse_args(argv=None):
                       "(CUDA, MPS, CPU); with Python CUDA if any, else CPU")
   g.add_argument('--actor-threads', type=int, default=0,
                  help='search threads per Rust actor; 0 = the cores shared out between the actors')
+  g.add_argument('--actor-lanes', type=int, default=0,
+                 help='searchers per Rust actor, each with a net call in flight, so one lane is '
+                      'walked while the other is on the GPU; 0 = 2 on CUDA, 1 elsewhere')
   g.add_argument('--learner-device', default='auto', help="'auto' is CUDA, then MPS, then CPU")
   g.add_argument('--learner-threads', type=int, default=2,
                  help='torch threads for the learner, if it ends up on the CPU')
@@ -188,8 +191,9 @@ def parse_args(argv=None):
   # process and cannot use a GPU well at any batch size. Two Rust actors
   # rather than one because a step is a chain -- walk trees, run the net,
   # back up -- and with one process the cores idle while the GPU works and
-  # vice versa; a second process fills those gaps (measured 1.5x, a third
-  # adds little). Each one holds ~9 GB at 4096 games.
+  # vice versa; a second process fills those gaps (measured 1.5x on MPS, a
+  # third adds little). On CUDA an actor also overlaps the two inside itself
+  # (--actor-lanes, see RustBackend). Each one holds ~9 GB at 4096 games.
   rust = args.backend == 'rust'
   if args.actors is None:
     args.actors = 2 if rust else max(1, cores - 2)
@@ -479,9 +483,10 @@ def actor_main(rank, args, shared, lock, version, games_q, sims, resign_on, step
 
   net = RLNet(**args.model_config).to(device).eval()
   seen = pull(net, shared, lock, version)
+  lanes = args.actor_lanes or (2 if str(device).startswith('cuda') else 1)
   backend = make_backend(args.backend, net, device, args.c_puct, args.fpu_reduction,
                          seed=None if args.seed is None else args.seed * 1000 + rank,
-                         threads=args.actor_threads)
+                         threads=args.actor_threads, lanes=lanes)
   pool = OpponentPool(args, device, rng, os.path.join(args.out_dir, 'rl_snapshots'))
   games = [SelfPlayGame(args, rng, resign_on, backend, pool, step_now.value)
            for _ in range(args.games_per_actor)]

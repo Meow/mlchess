@@ -499,13 +499,21 @@ impl Searcher {
     }
 
     fn drop_tree(&mut self, id: usize) -> PyResult<()> {
-        self.tree(id)?;
+        self.settled(id)?;
         self.trees[id] = None;
         Ok(())
     }
 
+    /// Whether the tree has leaves out at the net (collected, not yet
+    /// applied). Such a tree must not be advanced, reset or dropped: the
+    /// leaves refer to its nodes. Python applies the batch first.
+    fn in_flight(&self, id: usize) -> PyResult<bool> {
+        Ok(!self.tree(id)?.pending.is_empty())
+    }
+
     #[pyo3(signature = (id, target, noise_alpha=0.0, noise_fraction=0.0))]
     fn reset_search(&mut self, id: usize, target: u32, noise_alpha: f32, noise_fraction: f32) -> PyResult<()> {
+        self.settled(id)?;
         let tree = self.tree_mut(id)?;
         tree.target = target;
         tree.sims = 0;
@@ -515,6 +523,7 @@ impl Searcher {
     }
 
     fn advance(&mut self, id: usize, uci: &str) -> PyResult<()> {
+        self.settled(id)?;
         let tree = self.tree_mut(id)?;
         let m = parse_move(&tree.pos, uci)?;
         tree.advance(&m);
@@ -527,6 +536,9 @@ impl Searcher {
     /// left to search.
     fn collect<'py>(&mut self, py: Python<'py>, leaves_per_tree: u32)
         -> PyResult<(Bound<'py, PyArray2<i64>>, Bound<'py, PyArray1<f32>>, Bound<'py, PyArray2<i64>>)> {
+        if !self.batched.is_empty() {
+            return Err(PyValueError::new_err("collect() called with a batch still out: apply() it first"));
+        }
         let c_puct = self.c_puct;
         let fpu = self.fpu_reduction;
         let trees = &mut self.trees;
@@ -638,10 +650,13 @@ impl Searcher {
         Ok(())
     }
 
-    /// Ids of trees whose search has reached its target.
+    /// Ids of trees whose search has reached its target and whose last leaves
+    /// have been applied -- a tree with leaves still out at the net is not
+    /// done, whatever its count says, since their answers have not been
+    /// backed up yet (and it must not be advanced under them).
     fn done(&self) -> Vec<usize> {
         (0..self.trees.len())
-            .filter(|&i| self.trees[i].as_ref().map_or(false, |t| t.target > 0 && t.sims >= t.target))
+            .filter(|&i| self.trees[i].as_ref().map_or(false, |t| t.target > 0 && t.sims >= t.target && t.pending.is_empty()))
             .collect()
     }
 
@@ -793,6 +808,14 @@ impl Searcher {
 impl Searcher {
     fn tree(&self, id: usize) -> PyResult<&Tree> {
         self.trees.get(id).and_then(|t| t.as_ref()).ok_or_else(|| PyValueError::new_err("no such tree"))
+    }
+
+    fn settled(&self, id: usize) -> PyResult<()> {
+        if self.tree(id)?.pending.is_empty() {
+            Ok(())
+        } else {
+            Err(PyValueError::new_err(format!("tree {} has leaves out at the net: apply() the batch first", id)))
+        }
     }
 
     fn tree_mut(&mut self, id: usize) -> PyResult<&mut Tree> {
