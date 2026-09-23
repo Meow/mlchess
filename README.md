@@ -106,9 +106,9 @@ eval vs greedy (net v12, 100 sims): +2 =0 -18  score 10.0%  elo -382 +/- 254  [2
 
 (Those are from the first twelve minutes of a run on a 16-core Mac. `resign on/off (wrong N%)` also appears once there is data: resigning is only allowed while the games that may never resign show it would have been right at least 95% of the time, because a wrongly resigned game is a wrong training label — and a young value head gets that wrong about a third of the time.)
 
-It writes `nighty_rl.pt` (the weights), `rl_checkpoint.pt` (to resume), and a copy of the weights every 10000 steps in `rl_snapshots/`. The replay buffer isn't saved, so after a restart it spends a couple of minutes refilling before it trains again.
+It writes `nighty_rl.pt` (the weights) and `rl_checkpoint.pt` (to resume) every 10 minutes and on exit, and a copy of the weights every 5000 steps in `rl_snapshots/`. Everything else -- the replay buffer, the games, the weights the actors read -- stays in RAM. The replay buffer isn't saved, so after a restart it spends a couple of minutes refilling before it trains again.
 
-With `--wandb` it logs everything in those progress lines, the evaluation results and the resignation stats to [Weights & Biases](https://wandb.ai) (`pip3 install wandb`, `wandb login` once), syncs `nighty_rl.pt` whenever it is rewritten, and uploads the final weights as a model artifact called `nighty_rl` when it stops. The run id is stored in the checkpoint, so stopping and restarting continues the same run. `--wandb-project` and `--wandb-name` name things; `WANDB_MODE=offline` logs to a local `wandb/` directory you can `wandb sync` later.
+With `--wandb` it logs everything in those progress lines, the evaluation results and the resignation stats to [Weights & Biases](https://wandb.ai) (`pip3 install wandb`, `wandb login` once), and uploads the final weights as a model artifact called `nighty_rl` when it stops. The run id is stored in the checkpoint, so stopping and restarting continues the same run. `--wandb-project` and `--wandb-name` name things; `WANDB_MODE=offline` logs to a local `wandb/` directory you can `wandb sync` later.
 
 Play it:
 

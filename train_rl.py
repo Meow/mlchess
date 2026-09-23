@@ -152,7 +152,9 @@ def parse_args(argv=None):
 
   g = p.add_argument_group('output')
   g.add_argument('--out-dir', default=os.path.dirname(os.path.abspath(__file__)))
-  g.add_argument('--save-every', type=int, default=1000, help='steps between checkpoints')
+  g.add_argument('--save-minutes', type=float, default=10,
+                 help='minutes between checkpoints (weights + optimizer, ~4 bytes x 3 per '
+                      'parameter each time; steps would be too often on a fast learner)')
   g.add_argument('--snapshot-every', type=int, default=5000,
                  help='steps between copies kept in rl_snapshots/ (also the opponent pool); 0 keeps none')
   g.add_argument('--log-every', type=float, default=30, help='seconds between progress lines')
@@ -740,11 +742,11 @@ def main():
                            config={k: v for k, v in vars(args).items() if k != 'model_config'},
                            tags=[args.backend, device])
     wandb_run.config.update({'model': config, 'parameters': n_params}, allow_val_change=True)
-    # Everything is plotted against the training step, and the current
-    # weights are synced whenever they are rewritten.
+    # Everything is plotted against the training step. The weights go up
+    # once, at the end, as the artifact (a live sync re-uploaded ~90 MB at
+    # every checkpoint).
     wandb.define_metric('step')
     wandb.define_metric('*', step_metric='step')
-    wandb.save(weights_path, base_path=args.out_dir, policy='live')
 
   shared = parameters_to_vector(net.parameters()).detach().float().cpu().share_memory_()
   lock = ctx.Lock()
@@ -860,7 +862,7 @@ def main():
       wandb.log(log)
     s.reset()
 
-  run_started = last_report = time.time()
+  run_started = last_report = last_save = time.time()
   try:
     while True:
       # Take whatever the actors have finished without waiting for more.
@@ -930,8 +932,9 @@ def main():
 
       if step % args.publish_every == 0:
         publish(net, shared, lock, version)
-      if step % args.save_every == 0:
+      if time.time() - last_save >= args.save_minutes * 60:
         save()
+        last_save = time.time()
       if args.snapshot_every and step % args.snapshot_every == 0:
         os.makedirs(snapshot_dir, exist_ok=True)
         save_net(net, os.path.join(snapshot_dir, f'step_{step:07d}.pt'))
